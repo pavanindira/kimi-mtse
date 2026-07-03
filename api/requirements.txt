@@ -1,0 +1,41 @@
+# ── Web framework ─────────────────────────────────────────────────────────────
+fastapi==0.115.5
+uvicorn[standard]==0.32.1      # ASGI server with uvloop + httptools
+python-multipart==0.0.12       # form parsing
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+python-jose[cryptography]==3.3.0   # JWT signing / verification
+bcrypt==5.0.0                      # password hashing (imported directly, no passlib)
+
+# ── Database ──────────────────────────────────────────────────────────────────
+sqlalchemy==2.0.36
+asyncpg==0.30.0                # async PostgreSQL driver
+alembic==1.14.0                # schema migrations
+greenlet==3.1.1                # required by SQLAlchemy async
+
+# ── Validation ────────────────────────────────────────────────────────────────
+pydantic==2.10.1
+pydantic-settings==2.6.1       # settings from env vars
+
+# ── Task queue ────────────────────────────────────────────────────────────────
+celery==5.4.0
+redis==5.0.7
+# celery-redbeat removed — no periodic tasks defined; using built-in beat scheduler
+
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+slowapi==0.1.9                 # FastAPI-native rate limiter (uses limits library)
+
+# ── PDF generation ────────────────────────────────────────────────────────────
+weasyprint==62.3
+jinja2==3.1.4
+
+# ── HTTP client ───────────────────────────────────────────────────────────────
+httpx==0.28.0                  # async HTTP (ZAP API calls, health checks)
+requests==2.32.3               # sync HTTP (MobSF REST API in Celery workers)
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+python-json-logger==2.0.7      # structured JSON log output in production
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+psycopg2-binary==2.9.9         # sync driver for Alembic migrations
+python-dotenv==1.0.1

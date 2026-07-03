@@ -1,0 +1,42 @@
+{
+  "last_run": {
+    "results": {
+      "iam": {
+        "findings": {
+          "iam-root-account-used-recently": {
+            "level": "danger",
+            "description": "Root account was used recently",
+            "rationale": "The root account has unrestricted access to all AWS services.",
+            "remediation": "Avoid using the root account for day-to-day operations.",
+            "items": ["arn:aws:iam::123456789012:root"]
+          },
+          "iam-user-no-mfa": {
+            "level": "warning",
+            "description": "IAM user has no MFA device",
+            "rationale": "MFA provides an additional layer of protection.",
+            "remediation": "Enable MFA for all IAM users with console access.",
+            "items": ["arn:aws:iam::123456789012:user/alice", "arn:aws:iam::123456789012:user/bob"]
+          },
+          "iam-password-policy-set": {
+            "level": "good",
+            "description": "Password policy is set",
+            "rationale": "Good — no action needed.",
+            "remediation": "",
+            "items": []
+          }
+        }
+      },
+      "s3": {
+        "findings": {
+          "s3-bucket-publicly-readable": {
+            "level": "danger",
+            "description": "S3 bucket is publicly readable",
+            "rationale": "Publicly readable buckets expose sensitive data.",
+            "remediation": "Remove public ACLs and enable S3 Block Public Access.",
+            "items": ["my-public-bucket", "another-open-bucket"]
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "app_name": "com.example.testapp",
+  "file_name": "testapp.apk",
+  "findings": {
+    "android_sql_injection": {
+      "metadata": {
+        "severity": "high",
+        "description": "Potential SQL Injection vulnerability detected",
+        "reference": "https://owasp.org/www-project-mobile-top-10/2016-risks/m7-client-code-quality"
+      },
+      "files": [
+        {"file_path": "com/example/db/UserDatabase.java", "match_lines": [42, 55]},
+        {"file_path": "com/example/db/ProductDatabase.java", "match_lines": [88]}
+      ]
+    },
+    "android_logging": {
+      "metadata": {
+        "severity": "low",
+        "description": "The App logs information. Sensitive information should never be logged.",
+        "reference": "https://mobile-security.gitbook.io/mobile-security-testing-guide/"
+      },
+      "files": [
+        {"file_path": "com/example/utils/Logger.java", "match_lines": [15]}
+      ]
+    }
+  },
+  "permissions": {
+    "android.permission.READ_CONTACTS": {
+      "status": "dangerous",
+      "info": "Allows an application to read the user's contacts data."
+    },
+    "android.permission.INTERNET": {
+      "status": "normal",
+      "info": "Allows applications to open network sockets."
+    },
+    "android.permission.CAMERA": {
+      "status": "dangerous",
+      "info": "Required to be able to access the camera device."
+    }
+  },
+  "network_security": {
+    "android_cleartext_traffic": {
+      "severity": "high",
+      "description": "Application allows cleartext HTTP traffic",
+      "recommendation": "Set android:usesCleartextTraffic to false in AndroidManifest.xml."
+    },
+    "ssl_pinning_implemented": {
+      "severity": "secure",
+      "description": "SSL pinning is implemented"
+    }
+  },
+  "appsec": {
+    "security_score": 42
+  }
+}

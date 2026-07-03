@@ -1,0 +1,59 @@
+# rbac-scan-jobs.yaml — Least-privilege RBAC for MSTE scan workers.
+#
+# Workers (running as the mste-scan-runner ServiceAccount) need permission
+# to create, read, and delete Jobs and Pods in the mste-scans namespace only.
+# They do NOT get cluster-wide permissions — if a worker is compromised,
+# the blast radius is limited to the mste-scans namespace.
+#
+# Apply with: kubectl apply -f k8s/rbac-scan-jobs.yaml
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mste-scans
+  labels:
+    app.kubernetes.io/part-of: mste
+    # PodSecurity admission — restrict what scan pods can do
+    pod-security.kubernetes.io/enforce:         restricted
+    pod-security.kubernetes.io/enforce-version: latest
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name:      mste-scan-runner
+  namespace: mste-scans
+  labels:
+    app.kubernetes.io/part-of: mste
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name:      mste-scan-job-creator
+  namespace: mste-scans
+rules:
+  # Jobs: full lifecycle for scan orchestration
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs:     ["create", "get", "list", "watch", "delete"]
+  # Pods: read logs and status
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs:     ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name:      mste-scan-runner-binding
+  namespace: mste-scans
+subjects:
+  - kind:      ServiceAccount
+    name:      mste-scan-runner
+    namespace: mste-scans
+roleRef:
+  kind:     Role
+  name:     mste-scan-job-creator
+  apiGroup: rbac.authorization.k8s.io

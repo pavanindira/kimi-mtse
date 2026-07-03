@@ -1,0 +1,332 @@
+services:
+
+  # ── REVERSE PROXY + REACT SPA ─────────────────────────────────────────────
+  nginx:
+    build:
+      context:    ./frontend
+      dockerfile: Dockerfile
+    container_name: mste-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - api
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus:   '0.5'
+          memory: '128m'
+
+  # ── FASTAPI BACKEND ────────────────────────────────────────────────────────
+  api:
+    build:
+      context:    ./api
+      dockerfile: Dockerfile
+    container_name: mste-api
+    expose:
+      - "8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${WEB_DB_USER:?}:${WEB_DB_PASSWORD:?}@postgres:5432/mste
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?}@redis:6379/0
+      - JWT_SECRET=${JWT_SECRET:?}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:?}
+      - ZAP_API_KEY=${ZAP_API_KEY:?}
+      - ZAP_API_URL=http://owasp-zap:8080
+      - HOST_PROJECT_PATH=${HOST_PROJECT_PATH:?}
+      - CORS_ORIGINS=https://${DOMAIN:-localhost}
+    env_file: .env
+    volumes:
+      - scan-artifacts:/app/targets
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health/ready || exit 1"]
+      interval: 15s
+      timeout:  5s
+      retries:  3
+      start_period: 30s
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn main:app --host 0.0.0.0 --port 8000
+                              --workers 4 --loop uvloop"
+    deploy:
+      resources:
+        limits:
+          cpus:   '2.0'
+          memory: '512m'
+
+  # ── CELERY WORKERS ────────────────────────────────────────────────────────
+  worker-web:
+    build:
+      context:    ./api
+      dockerfile: Dockerfile
+    container_name: mste-worker-web
+    command: celery -A tasks worker -Q web -c 2 --loglevel=info -n worker-web@%h
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${WEB_DB_USER:?}:${WEB_DB_PASSWORD:?}@postgres:5432/mste
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?}@redis:6379/0
+      - HOST_PROJECT_PATH=${HOST_PROJECT_PATH:?}
+      - ZAP_API_KEY=${ZAP_API_KEY:?}
+      - ZAP_API_URL=http://owasp-zap:8080
+    env_file: .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/app
+      - scan-artifacts:/app/targets
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus:   '2.0'
+          memory: '1g'
+
+  worker-sast:
+    build:
+      context:    ./api
+      dockerfile: Dockerfile
+    container_name: mste-worker-sast
+    command: celery -A tasks worker -Q sast -c 2 --loglevel=info -n worker-sast@%h
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${WEB_DB_USER:?}:${WEB_DB_PASSWORD:?}@postgres:5432/mste
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?}@redis:6379/0
+      - HOST_PROJECT_PATH=${HOST_PROJECT_PATH:?}
+    env_file: .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/app
+      - scan-artifacts:/app/targets
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus:   '2.0'
+          memory: '1g'
+
+  worker-infra:
+    build:
+      context:    ./api
+      dockerfile: Dockerfile
+    container_name: mste-worker-infra
+    command: celery -A tasks worker -Q infra -c 1 --loglevel=info -n worker-infra@%h
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${WEB_DB_USER:?}:${WEB_DB_PASSWORD:?}@postgres:5432/mste
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?}@redis:6379/0
+      - HOST_PROJECT_PATH=${HOST_PROJECT_PATH:?}
+      - MOBSF_URL=http://mobsf:8000
+      - MOBSF_API_KEY=${MOBSF_API_KEY:-mste-change-this-key}
+    env_file: .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/app
+      - scan-artifacts:/app/targets
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus:   '1.0'
+          memory: '512m'
+
+  worker-beat:
+    build:
+      context:    ./api
+      dockerfile: Dockerfile
+    container_name: mste-worker-beat
+    command: celery -A tasks beat --loglevel=info
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${WEB_DB_USER:?}:${WEB_DB_PASSWORD:?}@postgres:5432/mste
+      - REDIS_URL=redis://:${REDIS_PASSWORD:?}@redis:6379/0
+    env_file: .env
+    depends_on:
+      - redis
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus:   '0.25'
+          memory: '128m'
+
+  # ── INFRASTRUCTURE ─────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: mste-postgres
+    environment:
+      POSTGRES_USER:     ${WEB_DB_USER:?}
+      POSTGRES_PASSWORD: ${WEB_DB_PASSWORD:?}
+      POSTGRES_DB:       mste
+    env_file: .env
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./tools/db-init.sh:/docker-entrypoint-initdb.d/01-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${WEB_DB_USER:-mste_user} -d mste"]
+      interval: 5s
+      timeout:  3s
+      retries:  10
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus:   '2.0'
+          memory: '1g'
+
+  redis:
+    image: redis:7-alpine
+    container_name: mste-redis
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:?}
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    env_file: .env
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      timeout:  3s
+      retries:  5
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus:   '0.5'
+          memory: '640m'
+
+  # ── SCAN TOOLS ─────────────────────────────────────────────────────────────
+  owasp-zap:
+    image: ghcr.io/zaproxy/zaproxy:stable
+    container_name: mste-owasp-zap
+    command:
+      - zap.sh
+      - -daemon
+      - -host
+      - "0.0.0.0"
+      - -port
+      - "8080"
+      - -config
+      - api.addrs.addr.name=.*
+      - -config
+      - api.addrs.addr.regex=true
+      - -config
+      - api.key=${ZAP_API_KEY:?}
+      - -config
+      - api.localOnly=false
+    init: true
+    expose:
+      - "8080"
+    volumes:
+      - scan-artifacts:/zap/wrk:rw
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus:   '2.0'
+          memory: '2g'
+
+  caido:
+    image: caido/caido:latest
+    container_name: mste-caido
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - caido-data:/home/caido/.local/share/caido
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus:   '1.0'
+          memory: '512m'
+
+  hoppscotch:
+    image: hoppscotch/hoppscotch:latest
+    container_name: mste-hoppscotch
+    expose:
+      - "3000"
+    environment:
+      - DATABASE_URL=postgresql://${HOPP_DB_USER:?}:${HOPP_DB_PASSWORD:?}@postgres:5432/hoppscotch
+      - WHITELISTED_ORIGINS=${HOPPSCOTCH_ORIGIN:?}
+      - REDIRECT_URL=${HOPPSCOTCH_ORIGIN:?}
+      - ALLOW_SECURE_COOKIES=true
+      - JWT_SECRET=${HOPP_JWT_SECRET:?}
+      - SESSION_SECRET=${HOPP_SESSION_SECRET:?}
+      - DATA_ENCRYPTION_KEY=${HOPP_ENCRYPTION_KEY:?}
+      - VITE_ALLOWED_AUTH_PROVIDERS=
+      - VITE_BASE_URL=${HOPPSCOTCH_ORIGIN:?}
+      - VITE_BACKEND_URL=${HOPPSCOTCH_ORIGIN:?}
+      - VITE_REDIRECT_URL=${HOPPSCOTCH_ORIGIN:?}
+    env_file: .env
+    depends_on:
+      - postgres
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus:   '0.5'
+          memory: '512m'
+
+  # ── MOBILE SECURITY FRAMEWORK ─────────────────────────────────────────────
+  # MobSF analyses APK, IPA, and APPX files via its REST API.
+  # UI available at http://localhost:8008 — get the API key from /api/v1/api_docs.
+  # Set MOBSF_API_KEY in .env to the key shown after first login.
+  mobsf:
+    image: opensecurity/mobile-security-framework-mobsf:latest
+    container_name: mste-mobsf
+    expose:
+      - "8000"
+    ports:
+      - "127.0.0.1:8008:8000"
+    environment:
+      - MOBSF_API_KEY=${MOBSF_API_KEY:-mste-change-this-key}
+    volumes:
+      - mobsf-data:/home/mobsf/.MobSF
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus:   '2.0'
+          memory: '2g'
+
+  # ── DEV TARGET ─────────────────────────────────────────────────────────────
+  dvwa:
+    image: vulnerables/web-dvwa:latest
+    container_name: mste-dvwa
+    profiles: [dev]
+    ports:
+      - "127.0.0.1:8888:80"
+    environment:
+      - DVWA_DEFAULT_SECURITY_LEVEL=low
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  redis-data:
+  scan-artifacts:
+  caido-data:
+  mobsf-data:

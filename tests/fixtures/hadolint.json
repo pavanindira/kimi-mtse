@@ -1,0 +1,16 @@
+[
+  {
+    "line": 3,
+    "code": "DL3008",
+    "message": "Pin versions in apt get install. Instead of `apt-get install <package>` use `apt-get install <package>=<version>`",
+    "level": "warning",
+    "file": "Dockerfile"
+  },
+  {
+    "line": 7,
+    "code": "DL3009",
+    "message": "Delete the apt-get lists after installing something",
+    "level": "info",
+    "file": "Dockerfile"
+  }
+]

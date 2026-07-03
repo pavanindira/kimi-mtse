@@ -1,0 +1,38 @@
+{{/*
+  sysbox-runtimeclass.yaml — Phase 3: Rootless worker containers.
+
+  PROBLEM:
+    Workers currently mount /var/run/docker.sock, giving them full Docker
+    daemon access — equivalent to root on the host. A compromised scan
+    container could escape to the host via this socket.
+
+  SOLUTION — two options depending on environment:
+
+  Option A: Sysbox (recommended for bare-metal/VMs)
+    Sysbox is a container runtime that lets containers run Docker, systemd,
+    and other system software *inside* themselves without privileged mode or
+    host socket access. Worker containers use the "sysbox-runc" runtime.
+    Install: https://github.com/nestybox/sysbox
+
+  Option B: Kubernetes Jobs API (recommended for managed K8s)
+    Workers call the Kubernetes API directly to create Job resources for
+    each scan tool, rather than using Docker at all. No socket needed.
+    See workers/k8s_executor.py for implementation.
+
+  This template creates the RuntimeClass for Option A.
+  Enable with: workers.runtimeClassName = "sysbox-runc" in values.yaml
+*/}}
+
+{{- if .Values.workers.runtimeClassName }}
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: {{ .Values.workers.runtimeClassName }}
+handler: {{ .Values.workers.runtimeClassName }}
+scheduling:
+  nodeClassification:
+    # Sysbox must be installed on nodes that will run workers.
+    # Label nodes with: kubectl label node <node> sysbox-install=yes
+    nodeSelector:
+      sysbox-install: "yes"
+{{- end }}

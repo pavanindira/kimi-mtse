@@ -1,0 +1,40 @@
+{
+  "Results": [
+    {
+      "Target": "requirements.txt",
+      "Type": "pip",
+      "Vulnerabilities": [
+        {
+          "VulnerabilityID": "CVE-2023-32681",
+          "PkgName": "requests",
+          "InstalledVersion": "2.28.0",
+          "FixedVersion": "2.31.0",
+          "Severity": "MEDIUM",
+          "Title": "Requests forwards proxy-authorization header to destination servers",
+          "Description": "Requests library forwards Proxy-Authorization headers to destination servers.",
+          "CVSS": {
+            "nvd": {"V3Score": 6.1, "V3Vector": "CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:H/I:N/A:N"}
+          }
+        }
+      ],
+      "Secrets": [
+        {
+          "RuleID": "github-pat",
+          "Category": "GitHub",
+          "Title": "GitHub Personal Access Token",
+          "StartLine": 3,
+          "Match": "GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxx"
+        }
+      ],
+      "Misconfigurations": [
+        {
+          "Title": "No HEALTHCHECK defined",
+          "Description": "You should add a HEALTHCHECK instruction to your Docker image.",
+          "Message": "Add a HEALTHCHECK instruction to the Dockerfile.",
+          "Severity": "LOW",
+          "Resolution": "Add HEALTHCHECK instruction"
+        }
+      ]
+    }
+  ]
+}

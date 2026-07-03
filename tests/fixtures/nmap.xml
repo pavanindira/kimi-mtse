@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<nmaprun scanner="nmap" version="7.94">
+  <host>
+    <address addr="93.184.216.34" addrtype="ipv4"/>
+    <hostnames>
+      <hostname name="example.com" type="user"/>
+    </hostnames>
+    <ports>
+      <port protocol="tcp" portid="80">
+        <state state="open" reason="syn-ack"/>
+        <service name="http" product="nginx" version="1.24.0"/>
+      </port>
+      <port protocol="tcp" portid="443">
+        <state state="open" reason="syn-ack"/>
+        <service name="https" product="nginx" version="1.24.0"/>
+        <script id="ssl-cert" output="Subject: commonName=example.com"/>
+        <script id="vuln-heartbleed" output="VULNERABLE: Heartbleed Bug in OpenSSL detected"/>
+      </port>
+      <port protocol="tcp" portid="22">
+        <state state="closed" reason="reset"/>
+        <service name="ssh"/>
+      </port>
+    </ports>
+  </host>
+</nmaprun>

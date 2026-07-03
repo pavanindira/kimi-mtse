@@ -1,0 +1,8 @@
+{
+  "results": [
+    {"url": "https://example.com/admin", "status": 403, "input": {"FUZZ": "admin"}},
+    {"url": "https://example.com/api",   "status": 200, "input": {"FUZZ": "api"}},
+    {"url": "https://example.com/lost",  "status": 404, "input": {"FUZZ": "lost"}},
+    {"url": "https://example.com/err",   "status": 500, "input": {"FUZZ": "err"}}
+  ]
+}

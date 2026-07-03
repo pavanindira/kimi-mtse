@@ -1,0 +1,3 @@
+{"request":{"endpoint":"https://example.com/api/v1/users","method":"GET","source":"https://example.com"}}
+{"request":{"endpoint":"https://example.com/admin/dashboard","method":"GET","source":"https://example.com"}}
+{"bad-entry": "no endpoint key should be skipped"}

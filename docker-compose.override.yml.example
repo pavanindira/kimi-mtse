@@ -1,0 +1,28 @@
+# docker-compose.override.yml.example
+#
+# For local development WITHOUT Kubernetes, you can use this override
+# to mount the Docker socket for the legacy docker run fallback.
+#
+# Usage:
+#   cp docker-compose.override.yml.example docker-compose.override.yml
+#   docker compose up -d
+#
+# NOTE: This requires the worker containers to have Docker CLI installed
+# and the host Docker daemon running. This is NOT the recommended
+# production path — use K8s Jobs executor (Phase 3) instead.
+
+services:
+  worker-web:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/app
+
+  worker-sast:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/app
+
+  worker-infra:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/app

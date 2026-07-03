@@ -1,0 +1,46 @@
+[
+  {
+    "CheckID": "iam_root_no_access_key",
+    "CheckTitle": "Ensure no root account access key exists",
+    "ServiceName": "iam",
+    "Status": "FAIL",
+    "Severity": "critical",
+    "Region": "us-east-1",
+    "Resource_ID": "arn:aws:iam::123456789012:root",
+    "Description": "The root account should not have access keys.",
+    "Risk": "Root account access keys provide unrestricted access.",
+    "Remediation": {
+      "Recommendation": {
+        "Text": "Delete the root account access keys and use IAM users instead."
+      }
+    }
+  },
+  {
+    "CheckID": "cloudtrail_multiregion_enabled",
+    "CheckTitle": "Ensure CloudTrail is enabled in all regions",
+    "ServiceName": "cloudtrail",
+    "Status": "FAIL",
+    "Severity": "high",
+    "Region": "us-east-1",
+    "Resource_ID": "arn:aws:cloudtrail:us-east-1:123456789012:trail/MyTrail",
+    "Description": "CloudTrail is not enabled in all regions.",
+    "Risk": "Malicious activity may go undetected in uncovered regions.",
+    "Remediation": {
+      "Recommendation": {
+        "Text": "Enable CloudTrail with multi-region support."
+      }
+    }
+  },
+  {
+    "CheckID": "s3_bucket_default_encryption",
+    "CheckTitle": "Ensure all S3 buckets have encryption enabled",
+    "ServiceName": "s3",
+    "Status": "PASS",
+    "Severity": "medium",
+    "Region": "us-east-1",
+    "Resource_ID": "my-encrypted-bucket",
+    "Description": "S3 bucket has encryption enabled.",
+    "Risk": "",
+    "Remediation": {}
+  }
+]

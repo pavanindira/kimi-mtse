@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<OWASPZAPReport>
+  <site name="https://example.com" host="example.com" port="443" ssl="true">
+    <alerts>
+      <alertitem>
+        <alert>Cross Site Scripting (Reflected)</alert>
+        <name>Cross Site Scripting (Reflected)</name>
+        <riskcode>3</riskcode>
+        <confidence>2</confidence>
+        <riskdesc>High (Medium)</riskdesc>
+        <desc>&lt;p&gt;Cross-site Scripting (XSS) is an attack technique that involves&lt;/p&gt;</desc>
+        <solution>&lt;p&gt;Phase: Architecture and Design. Use a vetted library.&lt;/p&gt;</solution>
+        <cweid>79</cweid>
+        <instances>
+          <instance>
+            <uri>https://example.com/search?q=test</uri>
+            <method>GET</method>
+            <param>q</param>
+            <attack>&lt;script&gt;alert(1)&lt;/script&gt;</attack>
+            <evidence>&lt;script&gt;alert(1)&lt;/script&gt;</evidence>
+          </instance>
+        </instances>
+      </alertitem>
+      <alertitem>
+        <alert>Missing Anti-clickjacking Header</alert>
+        <name>Missing Anti-clickjacking Header</name>
+        <riskcode>2</riskcode>
+        <confidence>2</confidence>
+        <riskdesc>Medium (High)</riskdesc>
+        <desc>&lt;p&gt;The response does not include X-Frame-Options.&lt;/p&gt;</desc>
+        <solution>&lt;p&gt;Add X-Frame-Options header.&lt;/p&gt;</solution>
+        <cweid>0</cweid>
+        <instances>
+          <instance>
+            <uri>https://example.com/</uri>
+            <method>GET</method>
+            <param></param>
+            <attack></attack>
+            <evidence></evidence>
+          </instance>
+        </instances>
+      </alertitem>
+    </alerts>
+  </site>
+</OWASPZAPReport>

@@ -1,0 +1,7 @@
+[
+  {"id": "heartbleed",  "ip": "93.184.216.34/443", "port": "443", "severity": "CRITICAL", "finding": "VULNERABLE (server is vulnerable), heartbeat request triggered response", "cve": "CVE-2014-0160"},
+  {"id": "poodle",      "ip": "93.184.216.34/443", "port": "443", "severity": "HIGH",     "finding": "VULNERABLE, uses SSLv3+CBC (check mitigations)", "cve": null},
+  {"id": "cert_expiry", "ip": "93.184.216.34/443", "port": "443", "severity": "OK",       "finding": "Certificate is valid for 365 more days", "cve": null},
+  {"id": "hsts",        "ip": "93.184.216.34/443", "port": "443", "severity": "MEDIUM",   "finding": "No HSTS header sent", "cve": null},
+  {"id": "tls1",        "ip": "93.184.216.34/443", "port": "443", "severity": "NOT_TESTED","finding": "Not tested", "cve": null}
+]

@@ -1,0 +1,28 @@
+apiVersion: v2
+name: mste
+description: >
+  Modular Security Testing Engine — a self-hosted penetration testing platform
+  with FastAPI backend, React SPA, Celery workers, PostgreSQL, and Redis.
+type: application
+version: 2.0.0
+appVersion: "2.0.0"
+
+dependencies:
+  # Bitnami PostgreSQL sub-chart
+  - name:       postgresql
+    version:    "15.x.x"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition:  postgresql.enabled
+
+  # Bitnami Redis sub-chart
+  - name:       redis
+    version:    "19.x.x"
+    repository: "https://charts.bitnami.com/bitnami"
+    condition:  redis.enabled
+
+keywords:
+  - security
+  - penetration-testing
+  - vulnerability-management
+maintainers:
+  - name: MSTE Team

@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  # ── Shell script linting ──────────────────────────────────────────────────
+  shellcheck:
+    name: shellcheck scan.sh
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run shellcheck
+        # -S warning: report anything at warning severity or above.
+        # -x:         follow sourced scripts (none here, but good practice).
+        # -o all:     enable all optional checks.
+        run: shellcheck -S warning -x scan.sh
+
+  # ── Python tests ──────────────────────────────────────────────────────────
+  test:
+    name: pytest (${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: api
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio httpx aiosqlite \
+                      python-multipart python-json-logger
+
+      - name: Run tests
+        working-directory: .
+        env:
+          TESTING: "1"
+          DATABASE_URL: "sqlite+aiosqlite:///./test.db"
+          REDIS_URL: "redis://localhost:6379/0"
+          JWT_SECRET: "ci-test-jwt-secret-at-least-32-characters"
+          ADMIN_PASSWORD: "adminpass123"
+          HOST_PROJECT_PATH: "/tmp"
+          ZAP_API_KEY: "ci-test-zap-key"
+        run: python -m pytest tests/ -q --tb=short
+
+  # ── Docker build check ────────────────────────────────────────────────────
+  docker-build:
+    name: docker build api
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build API image
+        run: docker build -t mste-api:ci ./api
+
+  # ── Alembic migration smoke test ──────────────────────────────────────────
+  migrations:
+    name: alembic migrations
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: mste_user
+          POSTGRES_PASSWORD: mste_pass
+          POSTGRES_DB: mste
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: api
+        run: pip install -r requirements.txt alembic asyncpg
+
+      - name: Run migrations
+        working-directory: api
+        env:
+          DATABASE_URL: postgresql+asyncpg://mste_user:mste_pass@localhost:5432/mste
+          REDIS_URL: redis://localhost:6379/0
+          JWT_SECRET: ci-test-jwt-secret-at-least-32-characters
+          ADMIN_PASSWORD: adminpass123
+          HOST_PROJECT_PATH: /tmp
+          ZAP_API_KEY: ci-test-key
+        run: alembic upgrade head
+
+      - name: Verify downgrade works
+        working-directory: api
+        env:
+          DATABASE_URL: postgresql+asyncpg://mste_user:mste_pass@localhost:5432/mste
+          REDIS_URL: redis://localhost:6379/0
+          JWT_SECRET: ci-test-jwt-secret-at-least-32-characters
+          ADMIN_PASSWORD: adminpass123
+          HOST_PROJECT_PATH: /tmp
+          ZAP_API_KEY: ci-test-key
+        run: alembic downgrade base

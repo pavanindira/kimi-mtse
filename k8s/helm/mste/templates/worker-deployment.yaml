@@ -1,0 +1,69 @@
+{{/*
+  Worker deployments — one per queue type (web, sast, infra).
+  Each gets its own Deployment so KEDA can scale them independently
+  based on the length of their respective Redis queues.
+*/}}
+
+{{- range $queue, $cfg := .Values.workers }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mste.fullname" $ }}-worker-{{ $queue }}
+  labels:
+    {{- include "mste.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: worker-{{ $queue }}
+spec:
+  replicas: {{ $cfg.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "mste.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: worker-{{ $queue }}
+  template:
+    metadata:
+      labels:
+        {{- include "mste.selectorLabels" $ | nindent 8 }}
+        app.kubernetes.io/component: worker-{{ $queue }}
+    spec:
+      {{- with $.Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: worker-{{ $queue }}
+          image: "{{ $.Values.global.imageRegistry }}{{ $.Values.image.api.repository }}:{{ $.Values.image.api.tag }}"
+          imagePullPolicy: {{ $.Values.image.api.pullPolicy }}
+          command:
+            - celery
+            - -A
+            - tasks
+            - worker
+            - -Q
+            - {{ $queue }}
+            - -c
+            - {{ $cfg.concurrency | quote }}
+            - --loglevel=info
+            - -n
+            - worker-{{ $queue }}@%h
+          envFrom:
+            - secretRef:
+                name: {{ $.Values.secrets.existingSecret }}
+          env:
+            - name:  HOST_PROJECT_PATH
+              value: "/app"
+          volumeMounts:
+            - name:      scan-artifacts
+              mountPath: /app/targets
+            {{- if $.Values.workers.mountDockerSocket }}
+            # Sysbox runtime — workers run Docker inside the container
+            # without the host socket. See Phase 3 notes.
+            {{- end }}
+          resources: {{- toYaml $cfg.resources | nindent 12 }}
+      {{- if $.Values.workers.runtimeClassName }}
+      # Phase 3: use Sysbox runtime for rootless nested Docker
+      runtimeClassName: {{ $.Values.workers.runtimeClassName }}
+      {{- end }}
+      volumes:
+        - name: scan-artifacts
+          persistentVolumeClaim:
+            claimName: {{ include "mste.fullname" $ }}-artifacts
+{{- end }}

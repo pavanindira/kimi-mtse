@@ -1,0 +1,30 @@
+{
+  "results": [
+    {
+      "check_id": "python.lang.security.audit.dangerous-subprocess-use",
+      "path": "app/utils.py",
+      "start": {"line": 42},
+      "extra": {
+        "message": "Detected subprocess call with shell=True, which is a security risk.",
+        "severity": "ERROR",
+        "lines": "subprocess.run(cmd, shell=True)",
+        "metadata": {
+          "cwe": ["CWE-78"],
+          "references": ["https://owasp.org/www-community/attacks/Command_Injection"]
+        }
+      }
+    },
+    {
+      "check_id": "python.lang.security.audit.hardcoded-password",
+      "path": "app/config.py",
+      "start": {"line": 10},
+      "extra": {
+        "message": "Hardcoded password detected.",
+        "severity": "WARNING",
+        "lines": "PASSWORD = 'supersecret'",
+        "metadata": {"cwe": ["CWE-259"], "references": []}
+      }
+    }
+  ],
+  "errors": []
+}

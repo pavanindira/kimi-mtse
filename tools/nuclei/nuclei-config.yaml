@@ -1,0 +1,71 @@
+# =============================================================================
+# nuclei-config.yaml — MSTE Nuclei scan configuration
+#
+# Mounted read-only at /config/nuclei-config.yaml inside the scan container.
+# Passed to Nuclei via: -config /config/nuclei-config.yaml
+# =============================================================================
+
+# ── Template selection ────────────────────────────────────────────────────────
+# Run the security-focused template sets. Excludes noisy/low-signal categories.
+tags:
+  - cve
+  - sqli
+  - xss
+  - ssrf
+  - lfi
+  - rfi
+  - xxe
+  - ssti
+  - open-redirect
+  - exposure
+  - misconfig
+  - default-login
+  - auth-bypass
+  - injection
+  - takeover
+  - token-spray
+  - oast
+
+# Exclude templates that produce too many false positives or require
+# manual interaction to confirm
+exclude-tags:
+  - dos
+  - fuzz
+  - intrusive
+  - code
+
+# ── Performance ───────────────────────────────────────────────────────────────
+# Conservative defaults; overridden by --stealth mode in scan.sh
+bulk-size: 25          # templates to run concurrently per host
+concurrency: 25        # total concurrent requests
+rate-limit: 150        # max requests per second (overridden by -rl in scan.sh)
+timeout: 10            # seconds per request
+retries: 2
+
+# ── Output ────────────────────────────────────────────────────────────────────
+# Output format is set per-scan via -je flag; these are fallback defaults.
+silent: false
+verbose: false
+# Include request/response in JSON output for evidence capture
+include-rr: true
+
+# ── Network ───────────────────────────────────────────────────────────────────
+# Follow up to 3 redirects
+max-redirects: 3
+
+# Skip SSL certificate verification (common in internal engagements)
+insecure: true
+
+# ── Severity filter ───────────────────────────────────────────────────────────
+# Run all severity levels; parsers.py normalises them
+severity:
+  - critical
+  - high
+  - medium
+  - low
+  - info
+
+# ── Interactsh (OAST) ─────────────────────────────────────────────────────────
+# Used for blind SSRF, out-of-band XXE, etc.
+# Set to false to disable if your environment blocks outbound DNS/HTTP
+interactsh-disable: false

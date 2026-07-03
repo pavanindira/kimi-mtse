@@ -1,0 +1,72 @@
+{{/*
+  KEDA ScaledObjects — one per worker queue.
+
+  KEDA watches the Redis list length for each Celery queue and adjusts
+  worker replica counts accordingly:
+    - 0 jobs in queue → scale to 0 replicas (no idle workers)
+    - N jobs in queue → ceil(N / queueLengthPerReplica) replicas
+    - Hard cap at maxReplicas per queue type
+
+  Prerequisites:
+    helm repo add kedacore https://kedacore.github.io/charts
+    helm install keda kedacore/keda -n keda --create-namespace
+
+  The Redis connection uses the same mste-secrets Secret that workers use,
+  so no additional credentials are needed.
+*/}}
+
+{{- if .Values.keda.enabled }}
+
+{{- $queueMap := dict
+      "web"   "_kombu.binding.web"
+      "sast"  "_kombu.binding.sast"
+      "infra" "_kombu.binding.infra"
+-}}
+
+{{- range $queue, $redisKey := $queueMap }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "mste.fullname" $ }}-worker-{{ $queue }}
+  labels:
+    {{- include "mste.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: worker-{{ $queue }}
+spec:
+  scaleTargetRef:
+    name: {{ include "mste.fullname" $ }}-worker-{{ $queue }}
+
+  # Scale to zero when queue is empty for cooldownPeriod seconds
+  minReplicaCount: 0
+  maxReplicaCount: {{ index $.Values.keda.maxReplicas $queue }}
+  cooldownPeriod:  {{ $.Values.keda.cooldownPeriod }}
+  pollingInterval: 15
+
+  triggers:
+    - type: redis
+      metadata:
+        # Redis list key that Celery writes tasks to
+        listName:         {{ $redisKey | quote }}
+        listLength:       {{ $.Values.keda.queueLengthPerReplica | quote }}
+        enableTLS:        "false"
+        # Address comes from the Redis service name
+        address:          "{{ include "mste.fullname" $ }}-redis-master:6379"
+      authenticationRef:
+        name: {{ include "mste.fullname" $ }}-redis-trigger-auth
+
+---
+# TriggerAuthentication — tells KEDA where to find the Redis password
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ include "mste.fullname" $ }}-redis-trigger-auth
+  labels:
+    {{- include "mste.labels" $ | nindent 4 }}
+spec:
+  secretTargetRef:
+    - parameter: password
+      name:      {{ $.Values.secrets.existingSecret }}
+      key:       REDIS_PASSWORD
+
+{{- end }}
+{{- end }}

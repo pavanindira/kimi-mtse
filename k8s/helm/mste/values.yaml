@@ -1,0 +1,168 @@
+# =============================================================================
+# values.yaml — MSTE Helm chart default values.
+# Override with: helm install mste ./mste -f my-values.yaml
+# =============================================================================
+
+# ── Global ────────────────────────────────────────────────────────────────────
+global:
+  imageRegistry: ""          # prefix all images: e.g. "registry.example.com/"
+  imagePullSecrets: []
+
+image:
+  api:
+    repository: mste/api
+    tag:        "2.0.0"
+    pullPolicy: IfNotPresent
+  frontend:
+    repository: mste/frontend
+    tag:        "2.0.0"
+    pullPolicy: IfNotPresent
+
+# ── API ───────────────────────────────────────────────────────────────────────
+api:
+  replicaCount: 2
+  resources:
+    requests: { cpu: "250m", memory: "256Mi" }
+    limits:   { cpu: "1",    memory: "512Mi" }
+  env:
+    # All secrets should come from the mste-secrets Secret (see below).
+    # Only non-sensitive defaults are set here.
+    ZAP_API_URL:          "http://owasp-zap:8080"
+    JWT_EXPIRE_MINUTES:   "480"
+    CORS_ORIGINS:         "https://your-domain.com"
+
+  # Liveness / readiness probes
+  # Liveness: is the process alive? Never check external deps here —
+  # a failing dep would cause K8s to restart the pod in a loop.
+  livenessProbe:
+    httpGet: { path: /health/live, port: 8000 }
+    initialDelaySeconds: 15
+    periodSeconds:       20
+    failureThreshold:    3
+
+  # Readiness: can we serve traffic? Checks DB + Redis.
+  # K8s stops routing requests to the pod (without restarting it) on failure.
+  readinessProbe:
+    httpGet: { path: /health/ready, port: 8000 }
+    initialDelaySeconds: 10
+    periodSeconds:       5
+    failureThreshold:    2
+
+# ── Frontend (nginx serving React SPA) ───────────────────────────────────────
+frontend:
+  replicaCount: 2
+  resources:
+    requests: { cpu: "50m",  memory: "64Mi" }
+    limits:   { cpu: "200m", memory: "128Mi" }
+
+# ── Workers ───────────────────────────────────────────────────────────────────
+# Each worker type has its own Deployment so they scale independently.
+# KEDA ScaledObjects are created when keda.enabled = true.
+workers:
+  web:
+    replicaCount: 1          # minimum (KEDA scales up from here)
+    concurrency:  2
+    resources:
+      requests: { cpu: "500m", memory: "512Mi" }
+      limits:   { cpu: "2",    memory: "2Gi"  }
+  sast:
+    replicaCount: 1
+    concurrency:  2
+    resources:
+      requests: { cpu: "1",    memory: "1Gi" }
+      limits:   { cpu: "4",    memory: "4Gi" }
+  infra:
+    replicaCount: 1
+    concurrency:  1
+    resources:
+      requests: { cpu: "500m", memory: "512Mi" }
+      limits:   { cpu: "2",    memory: "2Gi"  }
+
+# ── KEDA autoscaling ──────────────────────────────────────────────────────────
+keda:
+  enabled: true
+  # Scale up when queue length exceeds this per replica
+  # e.g. 3 jobs in web queue → spin up 1 worker; 9 jobs → 3 workers
+  queueLengthPerReplica: 3
+  maxReplicas:
+    web:   10
+    sast:  5
+    infra: 3
+  # Scale to zero after this many seconds of idle queue
+  cooldownPeriod: 300
+
+# ── Ingress ───────────────────────────────────────────────────────────────────
+ingress:
+  enabled:   true
+  className: "nginx"
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    cert-manager.io/cluster-issuer:           "letsencrypt-prod"
+  hosts:
+    - host: your-domain.com
+      paths:
+        - path:     /api
+          pathType: Prefix
+          service:  api
+        - path:     /
+          pathType: Prefix
+          service:  frontend
+  tls:
+    - secretName: mste-tls
+      hosts:      ["your-domain.com"]
+
+# ── PostgreSQL (Bitnami sub-chart) ────────────────────────────────────────────
+postgresql:
+  enabled: true         # set false to use an external managed DB
+  auth:
+    existingSecret: mste-secrets
+    secretKeys:
+      adminPasswordKey:  POSTGRES_PASSWORD
+      userPasswordKey:   WEB_DB_PASSWORD
+    username: mste_user
+    database: mste
+  primary:
+    persistence:
+      size: 20Gi
+    resources:
+      requests: { cpu: "250m", memory: "256Mi" }
+      limits:   { cpu: "1",    memory: "1Gi"  }
+
+# ── Redis (Bitnami sub-chart) ─────────────────────────────────────────────────
+redis:
+  enabled: true         # set false to use an external managed Redis
+  auth:
+    existingSecret:    mste-secrets
+    existingSecretPasswordKey: REDIS_PASSWORD
+  master:
+    persistence:
+      size: 2Gi
+    resources:
+      requests: { cpu: "100m", memory: "128Mi" }
+      limits:   { cpu: "500m", memory: "512Mi" }
+  replica:
+    replicaCount: 1
+
+# ── Secrets (injected from external secret or Helm --set) ─────────────────────
+# DO NOT set real values here — use a Kubernetes Secret named mste-secrets.
+# Create it with:
+#   kubectl create secret generic mste-secrets \
+#     --from-literal=JWT_SECRET=<random> \
+#     --from-literal=ADMIN_PASSWORD=<strong> \
+#     --from-literal=DATABASE_URL=<url> \
+#     --from-literal=REDIS_URL=<url> \
+#     --from-literal=ZAP_API_KEY=<random> \
+#     --from-literal=POSTGRES_PASSWORD=<strong> \
+#     --from-literal=WEB_DB_PASSWORD=<strong> \
+#     --from-literal=REDIS_PASSWORD=<strong>
+secrets:
+  existingSecret: mste-secrets   # all env vars are read from this Secret
+
+# ── Persistent storage ────────────────────────────────────────────────────────
+persistence:
+  # scan-artifacts PVC shared between api and workers
+  artifacts:
+    enabled:      true
+    size:         50Gi
+    storageClass: ""     # use cluster default; set e.g. "standard" or "gp3"
+    accessMode:   ReadWriteMany   # requires NFS or a RWX-capable CSI driver

@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.venv/
+.idea/
+.vscode/
+targets/
+*.log
+*.sqlite3
+scan-artifacts/
+postgres-data/
+redis-data/
+caido-data/
+test.db
