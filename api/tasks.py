@@ -24,6 +24,8 @@ import logging
 import os
 import shlex
 import subprocess
+import tempfile
+import threading
 import urllib.parse
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -69,8 +71,8 @@ _celery_config: dict = dict(
     },
 )
 
-import os as _os
-if _os.getenv('TESTING') == '1':
+
+if os.getenv('TESTING') == '1':
     # In test mode: use in-memory backend so Celery never tries to connect
     # to Redis for result storage.  Tasks are still mocked via conftest.py
     # so they never actually execute; this config only prevents the result
@@ -364,11 +366,16 @@ def _docker_run(scan_id: str, name: str, args: list[str],
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
         )
-        for line in iter(proc.stdout.readline, ''):
-            lines.append(line.rstrip())
-            publish_progress(scan_id, line.rstrip())
-        proc.stdout.close()
-        proc.wait()
+        _timer = threading.Timer(14400, proc.kill)  # 4 hours
+        _timer.start()
+        try:
+            for line in iter(proc.stdout.readline, ''):
+                lines.append(line.rstrip())
+                publish_progress(scan_id, line.rstrip())
+            proc.stdout.close()
+            proc.wait()
+        finally:
+            _timer.cancel()
         return proc.returncode, '\n'.join(lines)
     except Exception as e:
         publish_progress(scan_id, f'Container error: {e}', level='error')
@@ -411,10 +418,15 @@ def run_web_scan(self, scan_id: str, target: str, folder: str,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
         )
-        for line in iter(proc.stdout.readline, ''):
-            publish_progress(scan_id, line.rstrip())
-        proc.stdout.close()
-        proc.wait()
+        _timer = threading.Timer(14400, proc.kill)  # 4 hours
+        _timer.start()
+        try:
+            for line in iter(proc.stdout.readline, ''):
+                publish_progress(scan_id, line.rstrip())
+            proc.stdout.close()
+            proc.wait()
+        finally:
+            _timer.cancel()
 
         if proc.returncode != 0:
             raise RuntimeError(f'scan.sh exited with code {proc.returncode}')
@@ -717,6 +729,7 @@ def run_cloud_scan(self, scan_id: str, target: str, folder: str,
 
     # ── Build credential environment for container runs ────────────────────────
     cred_env: list[str] = []
+    creds_path: str | None = None
 
     if provider == 'aws':
         key_id     = options.get('aws_access_key_id', '')
@@ -747,12 +760,14 @@ def run_cloud_scan(self, scan_id: str, target: str, folder: str,
                              level='error')
             _update_scan_status(scan_id, 'Failed', completed=True)
             return
-        # Write credentials file into the output dir (cleaned up with the scan)
-        creds_path = os.path.join(output_dir, 'gcp-credentials.json')
-        with open(creds_path, 'w') as f:
+        # Write credentials file with restrictive permissions (cleaned up with the scan)
+        fd, creds_path = tempfile.mkstemp(
+            dir=output_dir, prefix='gcp-creds-', suffix='.json')
+        os.chmod(creds_path, 0o600)
+        with os.fdopen(fd, 'w') as f:
             f.write(gcp_json)
         cred_env = [
-            '-e', 'GOOGLE_APPLICATION_CREDENTIALS=/output/gcp-credentials.json',
+            '-e', f'GOOGLE_APPLICATION_CREDENTIALS=/output/{os.path.basename(creds_path)}',
         ]
 
     elif provider == 'azure':
@@ -827,8 +842,7 @@ def run_cloud_scan(self, scan_id: str, target: str, folder: str,
     publish_progress(scan_id, '[Cloud Scan] Complete.', level='success')
 
     # Scrub GCP credentials file if written
-    creds_path = os.path.join(output_dir, 'gcp-credentials.json')
-    if os.path.exists(creds_path):
+    if creds_path and os.path.exists(creds_path):
         os.remove(creds_path)
 
 

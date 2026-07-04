@@ -379,6 +379,17 @@ async def scan_stream(
     if not scan:
         raise HTTPException(status_code=404, detail='Scan not found')
 
+    # Verify the current user owns the engagement this scan belongs to
+    if current_user.role != 'Admin':
+        engagement = (await db.execute(
+            select(Engagement).where(Engagement.id == scan.engagement_id)
+        )).scalar_one_or_none()
+        if not engagement or engagement.created_by != current_user.id:
+            raise HTTPException(
+                status_code=403,
+                detail='You do not have access to this scan',
+            )
+
     async def event_generator():
         redis  = aioredis.from_url(settings.redis_url, decode_responses=True)
         pubsub = redis.pubsub()
