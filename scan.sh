@@ -59,6 +59,12 @@ export SQLMAP_CPUS_LIMIT=${SQLMAP_CPUS_LIMIT:-"0.5"}
 
 export ZAP_MEMORY_LIMIT=${ZAP_MEMORY_LIMIT:-"2g"}
 export ZAP_CPUS_LIMIT=${ZAP_CPUS_LIMIT:-"1.5"}
+
+# --- SQLmap Detection Depth ---
+# Override defaults via environment to tune detection aggressiveness
+export SQLMAP_LEVEL=${SQLMAP_LEVEL:-"1"}
+export SQLMAP_RISK=${SQLMAP_RISK:-"1"}
+
 # Add limits for any other tools you run via Docker
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
@@ -217,6 +223,8 @@ RUNNING_CONTAINERS+=("${CNAME}")
 log_ok "Launching Nuclei (background)..."
 
 docker run -d --name "${CNAME}" \
+    --memory="${NUCLEI_MEMORY_LIMIT}" \
+    --cpus="${NUCLEI_CPUS_LIMIT}" \
     "${DOCKER_NET_ARGS[@]+"${DOCKER_NET_ARGS[@]}"}" \
     -v "${HOST_TARGETS}:/output" \
     -v "${HOST_PROJECT_PATH}/tools/nuclei:/config:ro" \
@@ -258,6 +266,8 @@ if [[ -n "${FFUF_STEALTH_ARGS}" ]]; then
 fi
 
 docker run -d --name "${CNAME}" \
+    --memory="512m" \
+    --cpus="0.5" \
     "${DOCKER_NET_ARGS[@]+"${DOCKER_NET_ARGS[@]}"}" \
     "${FFUF_ENV_ARGS[@]}" \
     -v "${HOST_TARGETS}:/output" \
@@ -273,21 +283,20 @@ if [[ "${RUN_KATANA}" == "true" ]]; then
     RUNNING_CONTAINERS+=("${CNAME}")
     log_ok "Launching Katana SPA crawler (background)..."
 
-    declare -a KATANA_ARGS=(
-        --name "${CNAME}"
-        "${DOCKER_NET_ARGS[@]+"${DOCKER_NET_ARGS[@]}"}"
-        -v "${HOST_TARGETS}:/output"
-        projectdiscovery/katana:latest
-        -u "${SCAN_TARGET}"
-        -jc -jsonl
-        -o "${CONTAINER_OUT}/katana-results.jsonl"
-        -silent
-    )
-    [[ -n "${AUTH_HEADER}" ]] && KATANA_ARGS+=(-H "${AUTH_HEADER}")
-    [[ -n "${PROXY}" ]]       && KATANA_ARGS+=(-proxy "${PROXY}")
-    [[ ${#KATANA_RL_ARGS[@]} -gt 0 ]] && KATANA_ARGS+=("${KATANA_RL_ARGS[@]}")
-
-    docker run -d "${KATANA_ARGS[@]}" >/dev/null
+    docker run -d --name "${CNAME}" \
+        --memory="1g" \
+        --cpus="1.0" \
+        "${DOCKER_NET_ARGS[@]+"${DOCKER_NET_ARGS[@]}"}" \
+        -v "${HOST_TARGETS}:/output" \
+        projectdiscovery/katana:latest \
+        -u "${SCAN_TARGET}" \
+        -jc -jsonl \
+        -o "${CONTAINER_OUT}/katana-results.jsonl" \
+        -silent \
+        "$([[ -n "${AUTH_HEADER}" ]] && echo "-H" "${AUTH_HEADER}")" \
+        "$([[ -n "${PROXY}" ]] && echo "-proxy" "${PROXY}")" \
+        "${KATANA_RL_ARGS[@]}" \
+        >/dev/null
 fi
 
 # ── SQLmap ────────────────────────────────────────────────────────────────────
@@ -296,25 +305,24 @@ if [[ "${RUN_SQLMAP}" == "true" ]]; then
     RUNNING_CONTAINERS+=("${CNAME}")
     log_ok "Launching SQLmap database probe (background)..."
 
-    declare -a SQLMAP_ARGS=(
-        --name "${CNAME}"
-        "${DOCKER_NET_ARGS[@]+"${DOCKER_NET_ARGS[@]}"}"
-        -v "${HOST_TARGETS}:/output"
-        paolobruno/sqlmap
-        -u "${SCAN_TARGET}"
-        --batch
-        --crawl=2
-        --forms
-        --crawl-exclude="logout|delete|destroy|remove"
-        --level=1
-        --risk=1
-        --output-dir="${CONTAINER_OUT}/sqlmap"
-    )
-    [[ -n "${AUTH_HEADER}" ]] && SQLMAP_ARGS+=(--headers="${AUTH_HEADER}")
-    [[ -n "${PROXY}" ]]       && SQLMAP_ARGS+=(--proxy="${PROXY}")
-
-    docker run -d "${SQLMAP_ARGS[@]}" >/dev/null
-    log_detail "SQLmap output → targets/${OUTPUT_FOLDER_NAME}/sqlmap/"
+    docker run -d --name "${CNAME}" \
+        --memory="${SQLMAP_MEMORY_LIMIT}" \
+        --cpus="${SQLMAP_CPUS_LIMIT}" \
+        "${DOCKER_NET_ARGS[@]+"${DOCKER_NET_ARGS[@]}"}" \
+        -v "${HOST_TARGETS}:/output" \
+        paolobruno/sqlmap \
+        -u "${SCAN_TARGET}" \
+        --batch \
+        --crawl=2 \
+        --forms \
+        --crawl-exclude="logout|delete|destroy|remove" \
+        --level=${SQLMAP_LEVEL} \
+        --risk=${SQLMAP_RISK} \
+        --output-dir="${CONTAINER_OUT}/sqlmap" \
+        "$([[ -n "${AUTH_HEADER}" ]] && echo "--headers=${AUTH_HEADER}")" \
+        "$([[ -n "${PROXY}" ]] && echo "--proxy=${PROXY}")" \
+        >/dev/null
+        log_detail "SQLmap output → targets/${OUTPUT_FOLDER_NAME}/sqlmap/"
 fi
 
 # ── testssl ───────────────────────────────────────────────────────────────────
@@ -324,6 +332,8 @@ if [[ "${SKIP_SSL}" == "false" ]]; then
     log_ok "Launching testssl.sh TLS review (background)..."
 
     docker run -d --name "${CNAME}" \
+        --memory="512m" \
+        --cpus="0.5" \
         "${DOCKER_NET_ARGS[@]+"${DOCKER_NET_ARGS[@]}"}" \
         -v "${HOST_TARGETS}:/output" \
         drwetter/testssl.sh:latest \
@@ -483,6 +493,8 @@ if [[ ${#RUNNING_CONTAINERS[@]} -gt 0 ]]; then
     for cname in "${RUNNING_CONTAINERS[@]}"; do
         log_detail "Waiting on: ${cname}"
         EXIT_CODE=$(timeout 7200 docker wait "${cname}" 2>/dev/null || echo "1")
+        # Capture container logs for observability before removal
+        docker logs "${cname}" >"${OUTPUT_DIR}/${cname}.log" 2>&1 || true
         docker rm -f "${cname}" >/dev/null 2>&1 || true
         if [[ "${EXIT_CODE}" == "124" ]]; then
             log_warn "Container ${cname} timed out after 2 hours"

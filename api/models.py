@@ -61,7 +61,7 @@ class User(Base):
     username:      Mapped[str]          = mapped_column(String(100), unique=True, nullable=False)
     password_hash: Mapped[str]          = mapped_column(String(255), nullable=False)
     role:          Mapped[str]          = mapped_column(String(50), default='Analyst')
-    created_at:    Mapped[datetime]     = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at:    Mapped[datetime]     = mapped_column(DateTime, default=func.now())
     last_login:    Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     def __repr__(self) -> str:
@@ -89,9 +89,9 @@ class Engagement(Base):
     client_name:  Mapped[str]               = mapped_column(String(200), nullable=False)
     description:  Mapped[Optional[str]]     = mapped_column(Text, nullable=True)
     status:       Mapped[str]               = mapped_column(String(50), default='Active')
-    created_at:   Mapped[datetime]          = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at:   Mapped[datetime]          = mapped_column(DateTime, default=func.now())
     updated_at:   Mapped[datetime]          = mapped_column(
-        DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+        DateTime, default=func.now(), onupdate=func.now())
     started_at:   Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_by:   Mapped[Optional[int]]     = mapped_column(
@@ -143,7 +143,7 @@ class Scan(Base):
     status:         Mapped[str]          = mapped_column(String(50), default='Queued')
     celery_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     options:        Mapped[Optional[dict]] = mapped_column(JSON, default=dict)
-    created_at:     Mapped[datetime]     = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at:     Mapped[datetime]     = mapped_column(DateTime, default=func.now())
     started_at:     Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     completed_at:   Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_by:     Mapped[Optional[int]] = mapped_column(
@@ -197,8 +197,9 @@ class Finding(Base):
     status:             Mapped[str]           = mapped_column(String(50), default='Open')
     analyst_notes:      Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     dedup_hash:         Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    first_seen:         Mapped[datetime]      = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
-    last_seen:          Mapped[datetime]      = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    tool_count:         Mapped[int]           = mapped_column(Integer, default=1)
+    first_seen:         Mapped[datetime]      = mapped_column(DateTime, default=func.now())
+    last_seen:          Mapped[datetime]      = mapped_column(DateTime, default=func.now())
 
     scan:     Mapped[Scan]              = relationship('Scan', back_populates='findings')
     evidence: Mapped[List[Evidence]]   = relationship('Evidence', back_populates='finding',
@@ -227,7 +228,7 @@ class Evidence(Base):
     label:      Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     content:    Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     file_path:  Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
-    created_at: Mapped[datetime]      = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at: Mapped[datetime]      = mapped_column(DateTime, default=func.now())
 
     finding: Mapped[Finding] = relationship('Finding', back_populates='evidence')
 
@@ -245,7 +246,7 @@ class ReportTemplate(Base):
     html_template: Mapped[str]           = mapped_column(Text, nullable=False)
     logo_base64:   Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     is_default:    Mapped[bool]          = mapped_column(Boolean, default=False)
-    created_at:    Mapped[datetime]      = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at:    Mapped[datetime]      = mapped_column(DateTime, default=func.now())
 
     def __repr__(self) -> str:
         return f'<ReportTemplate {self.name}>'
@@ -262,7 +263,7 @@ class AuditLog(Base):
 
     id:          Mapped[int]              = mapped_column(Integer, primary_key=True)
     timestamp:   Mapped[datetime]         = mapped_column(
-        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+        DateTime, default=func.now(), nullable=False)
     user_id:     Mapped[Optional[int]]    = mapped_column(
         Integer, ForeignKey('users.id'), nullable=True)
     username:    Mapped[Optional[str]]    = mapped_column(String(100), nullable=True)

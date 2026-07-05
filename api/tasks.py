@@ -318,6 +318,7 @@ def _upsert_finding(db: Session, scan_db_id: int, scan_id_str: str,
 
     if existing:
         existing.last_seen = datetime.now(timezone.utc)
+        existing.tool_count += 1
         if existing.status == 'Fixed':
             existing.status = 'Open'
         return existing
@@ -386,7 +387,10 @@ def _docker_run(scan_id: str, name: str, args: list[str],
 # WEB SCAN
 # ─────────────────────────────────────────────────────────────────────────────
 
-@celery.task(bind=True, name='tasks.run_web_scan', max_retries=1)
+@celery.task(bind=True, name='tasks.run_web_scan', max_retries=1,
+             # Scan options may contain sensitive auth headers; limit result
+             # backend exposure to 5 minutes (same as SAST/cloud/mobile).
+             result_expires=300)
 def run_web_scan(self, scan_id: str, target: str, folder: str,
                  options: dict[str, Any]):
     _update_scan_status(scan_id, 'Running', started=True)
@@ -610,7 +614,8 @@ def _parse_sast_findings(db: Session, scan_rec, output_dir: str, scan_id: str):
 # INFRA SCAN
 # ─────────────────────────────────────────────────────────────────────────────
 
-@celery.task(bind=True, name='tasks.run_infra_scan', max_retries=1)
+@celery.task(bind=True, name='tasks.run_infra_scan', max_retries=1,
+             result_expires=300)
 def run_infra_scan(self, scan_id: str, target: str, folder: str,
                    options: dict[str, Any]):
     _update_scan_status(scan_id, 'Running', started=True)
