@@ -397,6 +397,12 @@ class FindingOut(OrmModel):
     status:             str
     analyst_notes:      str | None
     tool_count:         int = 1
+    # ── Assignment & SLA ───────────────────────────────────────────────────────
+    assigned_to:        int | None = None
+    due_date:           datetime | None = None
+    # ── External ticket ────────────────────────────────────────────────────────
+    external_ticket_id:  str | None = None
+    external_ticket_url: str | None = None
     first_seen:         datetime | None
     last_seen:          datetime | None
 
@@ -548,3 +554,57 @@ class ProgressEvent(BaseModel):
     msg:   str
     level: str = 'info'    # info | success | error | warning
     ts:    str             # ISO timestamp
+
+
+# ── Integration Config ────────────────────────────────────────────────────────
+
+class IntegrationConfigCreate(BaseModel):
+    provider: str = Field(description='jira, servicenow, or azure_devops')
+    base_url: str = Field(min_length=1, max_length=500)
+    auth_token: str = Field(min_length=1, max_length=500, description='API token or password')
+    project_key: str | None = Field(default=None, max_length=100)
+
+    @field_validator('provider')
+    @classmethod
+    def valid_provider(cls, v: str) -> str:
+        valid = ('jira', 'servicenow', 'azure_devops')
+        if v not in valid:
+            raise ValueError(f'Provider must be one of: {valid}')
+        return v
+
+
+class IntegrationConfigOut(OrmModel):
+    id:            int
+    engagement_id: int
+    provider:      str
+    base_url:      str
+    project_key:   str | None
+    is_active:     bool
+    created_at:    datetime | None
+
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+
+class NotificationOut(OrmModel):
+    id:         int
+    event_type: str
+    title:      str
+    message:    str
+    link:       str | None
+    is_read:    bool
+    created_at: datetime | None
+
+
+class PaginatedNotifications(BaseModel):
+    items: list[NotificationOut]
+    total: int
+    unread: int
+
+
+# ── Assignment ────────────────────────────────────────────────────────────────
+
+class FindingAssignmentUpdate(BaseModel):
+    """Assign a finding to a specific user with an optional due date."""
+    assigned_to: int | None = None
+    due_date:    datetime | None = None
+

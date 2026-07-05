@@ -3,7 +3,7 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { admin, auth, engagements, findings, search } from './api';
+import { api, admin, auth, engagements, findings, search } from './api';
 import type { FindingOut, PaginatedFindings } from './api';
 
 // ── Query keys ────────────────────────────────────────────────────────────────
@@ -20,6 +20,8 @@ export const QK = {
   users:       ['users']                             as const,
   audit:       (p: object)       => ['audit',       p]      as const,
   templates:   ['report-templates']                  as const,
+  notifications: ['notifications']                    as const,
+  myFindings:  (p: object)       => ['my-findings', p]      as const,
 };
 
 
@@ -173,6 +175,15 @@ export function useFindings(params: {
   });
 }
 
+export function useMyFindings(params: {
+  severity?: string; status?: string; limit?: number; offset?: number;
+} = {}) {
+  return useQuery({
+    queryKey: QK.myFindings(params),
+    queryFn:  () => api.get('/api/findings/my', { params }).then(r => r.data),
+  });
+}
+
 export function useFinding(id: number) {
   return useQuery({
     queryKey: QK.finding(id),
@@ -222,6 +233,42 @@ export function useBulkStatus() {
     }) => findings.bulkStatus(ids, status, notes),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['findings'] }),
   });
+}
+
+export function useAssignFinding() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, assigned_to, due_date }: {
+      id: number; assigned_to?: number | null; due_date?: string | null;
+    }) => api.patch(`/api/findings/${id}/assign`, { assigned_to, due_date }).then(r => r.data),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['findings'] });
+      qc.invalidateQueries({ queryKey: ['my-findings'] });
+    },
+  });
+}
+
+
+// ── Notifications ───────────────────────────────────────────────────────────────
+
+export function useNotifications() {
+  const { data, refetch } = useQuery({
+    queryKey: QK.notifications,
+    queryFn: () => api.get('/api/notifications').then(r => r.data),
+    refetchInterval: 30000,
+  });
+
+  const markRead = useMutation({
+    mutationFn: (id: number) => api.post(`/api/notifications/${id}/read`).then(r => r.data),
+    onSuccess: () => refetch(),
+  });
+
+  const markAllRead = useMutation({
+    mutationFn: () => api.post('/api/notifications/read-all').then(r => r.data),
+    onSuccess: () => refetch(),
+  });
+
+  return { notifications: data, markRead, markAllRead, refetch };
 }
 
 
@@ -300,5 +347,42 @@ export function useUploadLogo() {
     mutationFn: ({ templateId, file }: { templateId: number; file: File }) =>
       admin.reportTemplates.uploadLogo(templateId, file),
     onSuccess: () => qc.invalidateQueries({ queryKey: QK.templates }),
+  });
+}
+
+
+// ── Integrations ────────────────────────────────────────────────────────────────
+
+export function useIntegrations(engId: number) {
+  return useQuery({
+    queryKey: ['integrations', engId],
+    queryFn: () => api.get(`/api/integrations/engagement/${engId}`).then(r => r.data),
+    enabled: !!engId,
+  });
+}
+
+export function useCreateIntegration() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { engagement_id: number; provider: string; base_url: string; auth_token: string; project_key?: string }) =>
+      api.post('/api/integrations', body).then(r => r.data),
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: ['integrations', vars.engagement_id] });
+    },
+  });
+}
+
+export function useDeleteIntegration() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => api.delete(`/api/integrations/${id}`).then(r => r.data),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['integrations'] }),
+  });
+}
+
+export function useCreateTicket() {
+  return useMutation({
+    mutationFn: ({ cfgId, findingId }: { cfgId: number; findingId: number }) =>
+      api.post(`/api/integrations/${cfgId}/ticket/${findingId}`).then(r => r.data),
   });
 }

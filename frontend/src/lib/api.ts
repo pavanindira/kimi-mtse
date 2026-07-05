@@ -401,3 +401,16 @@ export const admin = {
       }),
   },
 };
+
+
+// ── Generic API helper (for endpoints not yet in typed modules) ─────────────────
+
+export const api = {
+  get:   <T>(path: string, opts?: { params?: Record<string, any> }) => {
+    const qs = opts?.params ? '?' + new URLSearchParams(opts.params).toString() : '';
+    return apiFetch<T>(path + qs, { method: 'GET' });
+  },
+  post:   <T>(path: string, body?: any) => apiFetch<T>(path, { method: 'POST',  body: JSON.stringify(body) }),
+  patch:  <T>(path: string, body?: any) => apiFetch<T>(path, { method: 'PATCH', body: JSON.stringify(body) }),
+  delete: <T>(path: string)             => apiFetch<T>(path, { method: 'DELETE' }),
+};

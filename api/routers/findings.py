@@ -15,8 +15,8 @@ from utils import add_audit_log, get_client_ip
 from config import settings
 from database import get_db, AsyncSessionLocal
 from models import Engagement, Finding, Scan
-from schemas import (BulkStatusUpdate, EvidenceOut, FindingDetail, FindingOut,
-                     FindingNotesUpdate, FindingStatusUpdate,
+from schemas import (BulkStatusUpdate, EvidenceOut, FindingAssignmentUpdate, FindingDetail,
+                     FindingNotesUpdate, FindingOut, FindingStatusUpdate,
                      ManualFindingCreate, PaginatedFindings)
 router = APIRouter(tags=['findings'])
 
@@ -176,20 +176,15 @@ async def update_finding(
     return finding
 
 
-@router.patch('/api/findings/{finding_id}/notes', response_model=FindingOut)
-async def update_finding_notes(
+@router.patch('/api/findings/{finding_id}/assign', response_model=FindingOut)
+async def assign_finding(
     finding_id:   int,
-    body:         FindingNotesUpdate,
+    body:         FindingAssignmentUpdate,
     current_user: AnalystUser,
     request:      Request,
     db:           AsyncSession = Depends(get_db),
 ):
-    """
-    Update analyst notes on a finding without changing its status.
-
-    Notes support markdown. Use for confirming exploitability, recording
-    false-positive rationale, or linking remediation tickets.
-    """
+    """Assign a finding to a user and optionally set a due date."""
     result = await db.execute(
         select(Finding).where(Finding.id == finding_id)
     )
@@ -197,15 +192,61 @@ async def update_finding_notes(
     if not finding:
         raise HTTPException(status_code=404, detail='Finding not found')
 
-    finding.analyst_notes = body.notes
-    finding.last_seen     = datetime.now(timezone.utc)
+    finding.assigned_to = body.assigned_to
+    if body.due_date is not None:
+        finding.due_date = body.due_date
+    finding.last_seen = datetime.now(timezone.utc)
 
-    add_audit_log(db, action='finding.notes_updated',
+    # If assigned to someone, create a notification for them
+    if body.assigned_to and body.assigned_to != current_user.id:
+        from notifications import create_notification
+        await create_notification(
+            db, user_id=body.assigned_to,
+            event_type='finding.assigned',
+            title=f'Finding assigned: {finding.vulnerability_name}',
+            message=(f'You have been assigned a {finding.severity} finding: '
+                     f'{finding.vulnerability_name}'),
+            link=f'/findings/{finding.id}',
+        )
+
+    add_audit_log(db, action='finding.assigned',
                   user_id=current_user.id, username=current_user.username,
                   target_type='finding', target_id=finding.id,
                   target_name=finding.vulnerability_name,
+                  detail={'assigned_to': body.assigned_to, 'due_date': body.due_date.isoformat() if body.due_date else None},
                   ip_address=get_client_ip(request))
     return finding
+
+
+@router.get('/api/findings/my', response_model=PaginatedFindings)
+async def my_findings(
+    current_user: CurrentUser,
+    db:           AsyncSession = Depends(get_db),
+    status:       str | None = None,
+    severity:     str | None = None,
+    limit:        int = 200,
+    offset:       int = 0,
+):
+    """List findings assigned to the current user."""
+    clamped_limit = min(max(limit, 1), 500)
+
+    q = select(Finding).where(Finding.assigned_to == current_user.id)
+    if status:   q = q.where(Finding.status == status)
+    if severity: q = q.where(Finding.severity == severity)
+
+    total = (await db.execute(
+        select(func.count()).select_from(q.subquery())
+    )).scalar_one()
+
+    items = (await db.execute(
+        q.order_by(Finding.due_date.asc().nulls_last(), Finding.cvss_score.desc().nulls_last())
+         .limit(clamped_limit).offset(offset)
+    )).scalars().all()
+
+    pages = max(1, -(-total // clamped_limit))
+    return PaginatedFindings(
+        total=total, items=items, limit=clamped_limit, offset=offset, pages=pages,
+    )
 
 
 @router.post('/api/scans/{scan_id}/findings',

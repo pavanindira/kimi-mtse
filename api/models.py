@@ -198,12 +198,20 @@ class Finding(Base):
     analyst_notes:      Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     dedup_hash:         Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     tool_count:         Mapped[int]           = mapped_column(Integer, default=1)
+    # ── Assignment & SLA ───────────────────────────────────────────────────────
+    assigned_to:        Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey('users.id'), nullable=True, index=True)
+    due_date:           Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    # ── External ticket tracking ───────────────────────────────────────────────
+    external_ticket_id:  Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    external_ticket_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     first_seen:         Mapped[datetime]      = mapped_column(DateTime, default=func.now())
     last_seen:          Mapped[datetime]      = mapped_column(DateTime, default=func.now())
 
     scan:     Mapped[Scan]              = relationship('Scan', back_populates='findings')
     evidence: Mapped[List[Evidence]]   = relationship('Evidence', back_populates='finding',
                                                        cascade='all, delete-orphan')
+    assignee: Mapped[Optional[User]]   = relationship('User', foreign_keys=[assigned_to])
 
     def __repr__(self) -> str:
         return f'<Finding [{self.severity}] {self.vulnerability_name}>'
@@ -278,3 +286,54 @@ class AuditLog(Base):
 
     def __repr__(self) -> str:
         return f'<AuditLog {self.action} by {self.username} @ {self.timestamp}>'
+
+
+# ── Integration Config (Jira, ServiceNow, etc.) ─────────────────────────────────
+
+class IntegrationConfig(Base):
+    __tablename__ = 'integration_configs'
+    __table_args__ = (
+        Index('ix_integration_configs_engagement', 'engagement_id'),
+    )
+
+    id:            Mapped[int]           = mapped_column(Integer, primary_key=True)
+    engagement_id: Mapped[int]           = mapped_column(
+        Integer, ForeignKey('engagements.id'), nullable=False)
+    provider:      Mapped[str]           = mapped_column(String(50), nullable=False)
+    # e.g. 'jira', 'servicenow', 'azure_devops'
+    base_url:      Mapped[str]           = mapped_column(String(500), nullable=False)
+    # Token / API key — stored encrypted at the application level, not here.
+    # The raw token is encrypted with a per-instance Fernet key derived from
+    # JWT_SECRET so that a DB dump alone cannot decrypt credentials.
+    auth_token_encrypted: Mapped[str]   = mapped_column(String(500), nullable=False)
+    project_key:   Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    # Jira project key, ServiceNow table name, etc.
+    is_active:     Mapped[bool]          = mapped_column(Boolean, default=True)
+    created_at:    Mapped[datetime]      = mapped_column(DateTime, default=func.now())
+
+    engagement: Mapped[Engagement] = relationship('Engagement')
+
+
+# ── Notifications (in-app) ──────────────────────────────────────────────────────
+
+class Notification(Base):
+    __tablename__ = 'notifications'
+    __table_args__ = (
+        Index('ix_notifications_user_id', 'user_id'),
+        Index('ix_notifications_created_at', 'created_at'),
+    )
+
+    id:         Mapped[int]           = mapped_column(Integer, primary_key=True)
+    user_id:    Mapped[int]           = mapped_column(
+        Integer, ForeignKey('users.id'), nullable=False)
+    event_type: Mapped[str]           = mapped_column(String(80), nullable=False)
+    # e.g. 'scan.completed', 'finding.assigned', 'sla.breach'
+    title:      Mapped[str]           = mapped_column(String(255), nullable=False)
+    message:    Mapped[str]           = mapped_column(Text, nullable=False)
+    link:       Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    # URL path fragment the user should navigate to, e.g. '/findings/123'
+    is_read:    Mapped[bool]          = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime]      = mapped_column(DateTime, default=func.now())
+
+    user: Mapped[User] = relationship('User')
+

@@ -200,17 +200,21 @@ async def security_headers(request: Request, call_next):
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 
-from routers.auth        import router as auth_router
-from routers.engagements import router as engagements_router
-from routers.findings    import router as findings_router
-from routers.search      import router as search_router
-from routers.admin       import router as admin_router
+from routers.auth           import router as auth_router
+from routers.engagements    import router as engagements_router
+from routers.findings       import router as findings_router
+from routers.search         import router as search_router
+from routers.admin          import router as admin_router
+from routers.integrations   import router as integrations_router
+from routers.notifications  import router as notifications_router
 
 app.include_router(auth_router)
 app.include_router(engagements_router)
 app.include_router(findings_router)
 app.include_router(search_router)
 app.include_router(admin_router)
+app.include_router(integrations_router)
+app.include_router(notifications_router)
 
 
 # ── Health probes (unauthenticated — used by Docker / K8s) ───────────────────
