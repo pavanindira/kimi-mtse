@@ -4,7 +4,7 @@ FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz0b \
     libffi-dev libcairo2 libgdk-pixbuf2.0-0 \
-    docker.io curl git \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

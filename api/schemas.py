@@ -363,8 +363,8 @@ class ScanOut(OrmModel):
     created_at:     datetime | None
     started_at:     datetime | None
     completed_at:   datetime | None
-    # Populated automatically from the Scan.finding_count column_property —
-    # no manual setting required in any router.
+    # Populated by the bulk COUNT query in list_scans (engagements router) —
+    # not a SQLAlchemy column_property.  No manual setting required.
     finding_count:  int = 0
 
 
@@ -396,6 +396,7 @@ class FindingOut(OrmModel):
     remediation:        str | None
     status:             str
     analyst_notes:      str | None
+    tool_count:         int = 1
     first_seen:         datetime | None
     last_seen:          datetime | None
 

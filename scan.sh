@@ -49,6 +49,24 @@ SKIP_SSL=false
 ZAP_API_URL="${ZAP_API_URL:-http://owasp-zap:8080}"
 ZAP_API_KEY="${ZAP_API_KEY:-}"
 
+# --- Resource Limits Configuration ---
+# Define defaults if not provided by the environment
+export NUCLEI_MEMORY_LIMIT=${NUCLEI_MEMORY_LIMIT:-"1g"}
+export NUCLEI_CPUS_LIMIT=${NUCLEI_CPUS_LIMIT:-"1.0"}
+
+export SQLMAP_MEMORY_LIMIT=${SQLMAP_MEMORY_LIMIT:-"512m"}
+export SQLMAP_CPUS_LIMIT=${SQLMAP_CPUS_LIMIT:-"0.5"}
+
+export ZAP_MEMORY_LIMIT=${ZAP_MEMORY_LIMIT:-"2g"}
+export ZAP_CPUS_LIMIT=${ZAP_CPUS_LIMIT:-"1.5"}
+
+# --- SQLmap Detection Depth ---
+# Override defaults via environment to tune detection aggressiveness
+export SQLMAP_LEVEL=${SQLMAP_LEVEL:-"1"}
+export SQLMAP_RISK=${SQLMAP_RISK:-"1"}
+
+# Add limits for any other tools you run via Docker
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 if [[ $# -eq 0 ]]; then
     log_error "Usage: scan.sh <TARGET_URL> [--auth-header <val>] [--proxy <url>]"
@@ -107,7 +125,7 @@ echo ""
 
 # ── Pre-flight check ──────────────────────────────────────────────────────────
 log_info "Pre-flight connectivity check for ${TARGET}..."
-HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 8 "${TARGET}" 2>/dev/null || echo "000")
+HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" --connect-timeout 8 --max-time 15 "${TARGET}" 2>/dev/null || echo "000")
 
 if [[ "${HTTP_CODE}" == "000" ]]; then
     log_error "Target unreachable (HTTP 000). Aborting."
@@ -205,6 +223,8 @@ RUNNING_CONTAINERS+=("${CNAME}")
 log_ok "Launching Nuclei (background)..."
 
 docker run -d --name "${CNAME}" \
+    --memory="${NUCLEI_MEMORY_LIMIT}" \
+    --cpus="${NUCLEI_CPUS_LIMIT}" \
     "${DOCKER_NET_ARGS[@]+"${DOCKER_NET_ARGS[@]}"}" \
     -v "${HOST_TARGETS}:/output" \
     -v "${HOST_PROJECT_PATH}/tools/nuclei:/config:ro" \
@@ -246,6 +266,8 @@ if [[ -n "${FFUF_STEALTH_ARGS}" ]]; then
 fi
 
 docker run -d --name "${CNAME}" \
+    --memory="512m" \
+    --cpus="0.5" \
     "${DOCKER_NET_ARGS[@]+"${DOCKER_NET_ARGS[@]}"}" \
     "${FFUF_ENV_ARGS[@]}" \
     -v "${HOST_TARGETS}:/output" \
@@ -261,21 +283,20 @@ if [[ "${RUN_KATANA}" == "true" ]]; then
     RUNNING_CONTAINERS+=("${CNAME}")
     log_ok "Launching Katana SPA crawler (background)..."
 
-    declare -a KATANA_ARGS=(
-        --name "${CNAME}"
-        "${DOCKER_NET_ARGS[@]+"${DOCKER_NET_ARGS[@]}"}"
-        -v "${HOST_TARGETS}:/output"
-        projectdiscovery/katana:latest
-        -u "${SCAN_TARGET}"
-        -jc -jsonl
-        -o "${CONTAINER_OUT}/katana-results.jsonl"
-        -silent
-    )
-    [[ -n "${AUTH_HEADER}" ]] && KATANA_ARGS+=(-H "${AUTH_HEADER}")
-    [[ -n "${PROXY}" ]]       && KATANA_ARGS+=(-proxy "${PROXY}")
-    [[ ${#KATANA_RL_ARGS[@]} -gt 0 ]] && KATANA_ARGS+=("${KATANA_RL_ARGS[@]}")
-
-    docker run -d "${KATANA_ARGS[@]}" >/dev/null
+    docker run -d --name "${CNAME}" \
+        --memory="1g" \
+        --cpus="1.0" \
+        "${DOCKER_NET_ARGS[@]+"${DOCKER_NET_ARGS[@]}"}" \
+        -v "${HOST_TARGETS}:/output" \
+        projectdiscovery/katana:latest \
+        -u "${SCAN_TARGET}" \
+        -jc -jsonl \
+        -o "${CONTAINER_OUT}/katana-results.jsonl" \
+        -silent \
+        "$([[ -n "${AUTH_HEADER}" ]] && echo "-H" "${AUTH_HEADER}")" \
+        "$([[ -n "${PROXY}" ]] && echo "-proxy" "${PROXY}")" \
+        "${KATANA_RL_ARGS[@]}" \
+        >/dev/null
 fi
 
 # ── SQLmap ────────────────────────────────────────────────────────────────────
@@ -284,25 +305,24 @@ if [[ "${RUN_SQLMAP}" == "true" ]]; then
     RUNNING_CONTAINERS+=("${CNAME}")
     log_ok "Launching SQLmap database probe (background)..."
 
-    declare -a SQLMAP_ARGS=(
-        --name "${CNAME}"
-        "${DOCKER_NET_ARGS[@]+"${DOCKER_NET_ARGS[@]}"}"
-        -v "${HOST_TARGETS}:/output"
-        paolobruno/sqlmap
-        -u "${SCAN_TARGET}"
-        --batch
-        --crawl=2
-        --forms
-        --crawl-exclude="logout|delete|destroy|remove"
-        --level=1
-        --risk=1
-        --output-dir="${CONTAINER_OUT}/sqlmap"
-    )
-    [[ -n "${AUTH_HEADER}" ]] && SQLMAP_ARGS+=(--headers="${AUTH_HEADER}")
-    [[ -n "${PROXY}" ]]       && SQLMAP_ARGS+=(--proxy="${PROXY}")
-
-    docker run -d "${SQLMAP_ARGS[@]}" >/dev/null
-    log_detail "SQLmap output → targets/${OUTPUT_FOLDER_NAME}/sqlmap/"
+    docker run -d --name "${CNAME}" \
+        --memory="${SQLMAP_MEMORY_LIMIT}" \
+        --cpus="${SQLMAP_CPUS_LIMIT}" \
+        "${DOCKER_NET_ARGS[@]+"${DOCKER_NET_ARGS[@]}"}" \
+        -v "${HOST_TARGETS}:/output" \
+        paolobruno/sqlmap \
+        -u "${SCAN_TARGET}" \
+        --batch \
+        --crawl=2 \
+        --forms \
+        --crawl-exclude="logout|delete|destroy|remove" \
+        --level=${SQLMAP_LEVEL} \
+        --risk=${SQLMAP_RISK} \
+        --output-dir="${CONTAINER_OUT}/sqlmap" \
+        "$([[ -n "${AUTH_HEADER}" ]] && echo "--headers=${AUTH_HEADER}")" \
+        "$([[ -n "${PROXY}" ]] && echo "--proxy=${PROXY}")" \
+        >/dev/null
+        log_detail "SQLmap output → targets/${OUTPUT_FOLDER_NAME}/sqlmap/"
 fi
 
 # ── testssl ───────────────────────────────────────────────────────────────────
@@ -312,6 +332,8 @@ if [[ "${SKIP_SSL}" == "false" ]]; then
     log_ok "Launching testssl.sh TLS review (background)..."
 
     docker run -d --name "${CNAME}" \
+        --memory="512m" \
+        --cpus="0.5" \
         "${DOCKER_NET_ARGS[@]+"${DOCKER_NET_ARGS[@]}"}" \
         -v "${HOST_TARGETS}:/output" \
         drwetter/testssl.sh:latest \
@@ -341,7 +363,7 @@ if [[ "${RUN_ZAP_ACTIVE}" == "true" ]]; then
         # a prior scan remain in memory. Reset before each scan so Client A's
         # session data can never leak into Client B's results.
         log_info "Resetting ZAP session..."
-        curl -sf "${ZAP_AUTH_HEADER[@]}" \
+        curl -sf --max-time 30 --connect-timeout 5 "${ZAP_AUTH_HEADER[@]}" \
             "${ZAP_API_URL}/JSON/core/action/newSession/?name=mste_${CNAME_SUFFIX}&overwrite=true" \
             >/dev/null 2>/dev/null || log_warn "ZAP session reset failed — proceeding anyway"
 
@@ -359,7 +381,7 @@ if [[ "${RUN_ZAP_ACTIVE}" == "true" ]]; then
                 "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" \
                 "${HEADER_VAL}")
 
-            ADD_RULE_RESP=$(curl -sf "${ZAP_AUTH_HEADER[@]}" \
+            ADD_RULE_RESP=$(curl -sf --max-time 30 --connect-timeout 5 "${ZAP_AUTH_HEADER[@]}" \
                 "${ZAP_API_URL}/JSON/replacer/action/addRule/?description=MSTE_Auth_Injection&enabled=true&matchType=REQ_HEADER&matchRegex=false&matchString=${H_NAME_ENC}&replacement=${H_VAL_ENC}" 2>/dev/null || echo "")
 
             if echo "${ADD_RULE_RESP}" | grep -q '"Result":"OK"'; then
@@ -372,7 +394,7 @@ if [[ "${RUN_ZAP_ACTIVE}" == "true" ]]; then
 
         # ── Spider ────────────────────────────────────────────────────────────
         log_ok "Starting ZAP Spider against ${SCAN_TARGET}..."
-        SPIDER_RESP=$(curl -sf "${ZAP_AUTH_HEADER[@]}" \
+        SPIDER_RESP=$(curl -sf --max-time 30 --connect-timeout 5 "${ZAP_AUTH_HEADER[@]}" \
             "${ZAP_API_URL}/JSON/spider/action/scan/?url=${SCAN_TARGET}&maxChildren=15&recurse=true" \
             2>/dev/null || echo "{}")
         SPIDER_ID=$(python3 -c \
@@ -385,7 +407,7 @@ if [[ "${RUN_ZAP_ACTIVE}" == "true" ]]; then
         while true; do
             sleep 5
             SPIDER_WAITED=$((SPIDER_WAITED + 1))
-            STATUS_RESP=$(curl -sf "${ZAP_AUTH_HEADER[@]}" \
+            STATUS_RESP=$(curl -sf --max-time 10 --connect-timeout 5 "${ZAP_AUTH_HEADER[@]}" \
                 "${ZAP_API_URL}/JSON/spider/view/status/?scanId=${SPIDER_ID}" \
                 2>/dev/null || echo "{}")
             SPIDER_PROG=$(python3 -c \
@@ -402,7 +424,7 @@ if [[ "${RUN_ZAP_ACTIVE}" == "true" ]]; then
 
         # ── Active Scan ───────────────────────────────────────────────────────
         log_ok "Starting ZAP Active Scan against ${SCAN_TARGET}..."
-        ASCAN_RESP=$(curl -sf "${ZAP_AUTH_HEADER[@]}" \
+        ASCAN_RESP=$(curl -sf --max-time 30 --connect-timeout 5 "${ZAP_AUTH_HEADER[@]}" \
             "${ZAP_API_URL}/JSON/ascan/action/scan/?url=${SCAN_TARGET}&recurse=true&inScopeOnly=false" \
             2>/dev/null || echo "{}")
         ASCAN_ID=$(python3 -c \
@@ -416,7 +438,7 @@ if [[ "${RUN_ZAP_ACTIVE}" == "true" ]]; then
         while true; do
             sleep 10
             ASCAN_WAITED=$((ASCAN_WAITED + 1))
-            STATUS_RESP=$(curl -sf "${ZAP_AUTH_HEADER[@]}" \
+            STATUS_RESP=$(curl -sf --max-time 10 --connect-timeout 5 "${ZAP_AUTH_HEADER[@]}" \
                 "${ZAP_API_URL}/JSON/ascan/view/status/?scanId=${ASCAN_ID}" \
                 2>/dev/null || echo "{}")
             ASCAN_PROG=$(python3 -c \
@@ -448,13 +470,13 @@ if [[ "${RUN_ZAP_ACTIVE}" == "true" ]]; then
         # ── Export ZAP XML report ─────────────────────────────────────────────
         ZAP_XML_PATH="${OUTPUT_DIR}/zap-active-report.xml"
         log_info "Exporting ZAP XML report → ${ZAP_XML_PATH}"
-        curl -sf "${ZAP_AUTH_HEADER[@]}" \
+        curl -sf --max-time 60 --connect-timeout 5 "${ZAP_AUTH_HEADER[@]}" \
             "${ZAP_API_URL}/OTHER/core/other/xmlreport/" \
             >"${ZAP_XML_PATH}" 2>/dev/null || log_warn "ZAP XML export failed"
 
         # ── Clean up replacer rule ────────────────────────────────────────────
         if [[ "${ZAP_REPLACER_RULE_ADDED}" == "true" ]]; then
-            curl -sf "${ZAP_AUTH_HEADER[@]}" \
+            curl -sf --max-time 30 --connect-timeout 5 "${ZAP_AUTH_HEADER[@]}" \
                 "${ZAP_API_URL}/JSON/replacer/action/removeRule/?description=MSTE_Auth_Injection" \
                 >/dev/null 2>&1 || true
             log_detail "ZAP replacer rule removed"
@@ -470,9 +492,13 @@ if [[ ${#RUNNING_CONTAINERS[@]} -gt 0 ]]; then
     log_info "Waiting for ${#RUNNING_CONTAINERS[@]} background tool(s) to complete..."
     for cname in "${RUNNING_CONTAINERS[@]}"; do
         log_detail "Waiting on: ${cname}"
-        EXIT_CODE=$(docker wait "${cname}" 2>/dev/null || echo "1")
-        docker rm "${cname}" >/dev/null 2>&1 || true
-        if [[ "${EXIT_CODE}" != "0" ]]; then
+        EXIT_CODE=$(timeout 7200 docker wait "${cname}" 2>/dev/null || echo "1")
+        # Capture container logs for observability before removal
+        docker logs "${cname}" >"${OUTPUT_DIR}/${cname}.log" 2>&1 || true
+        docker rm -f "${cname}" >/dev/null 2>&1 || true
+        if [[ "${EXIT_CODE}" == "124" ]]; then
+            log_warn "Container ${cname} timed out after 2 hours"
+        elif [[ "${EXIT_CODE}" != "0" ]]; then
             log_warn "Container ${cname} exited with code ${EXIT_CODE}"
         fi
     done
