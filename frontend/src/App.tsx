@@ -16,7 +16,7 @@ const Search         = lazy(() => import('./pages/Search'));
 const AdminUsers          = lazy(() => import('./pages/AdminUsers'));
 const AdminAudit          = lazy(() => import('./pages/AdminAudit'));
 const AdminReportTemplates = lazy(() => import('./pages/AdminReportTemplates'));
-const MyFindings       = lazy(() => import('./pages/MyFindings'));
+const Profile             = lazy(() => import('./pages/Profile'));
 
 const qc = new QueryClient({
   defaultOptions: {
@@ -55,7 +55,6 @@ function AppRoutes() {
           <Route path="engagements/new"      element={<NewEngagement />} />
           <Route path="engagements/:id"      element={<Engagement />} />
           <Route path="findings"       element={<Findings />} />
-          <Route path="my-findings"    element={<MyFindings />} />
           <Route path="findings/:id"   element={<FindingPage />} />
           <Route path="search"         element={<Search />} />
           <Route path="admin/users"    element={

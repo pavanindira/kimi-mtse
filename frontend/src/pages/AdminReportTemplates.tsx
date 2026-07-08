@@ -1,14 +1,33 @@
-import { useRef } from 'react';
-import { useReportTemplates, useUploadLogo } from '../lib/hooks';
+import { useState, useRef } from 'react';
+import {
+  useReportTemplates, useUploadLogo, useReportTemplateDetail,
+  useCreateReportTemplate, useUpdateReportTemplate, useDeleteReportTemplate,
+} from '../lib/hooks';
 import { admin } from '../lib/api';
 import { useQueryClient } from '@tanstack/react-query';
 import { QK } from '../lib/hooks';
 
+const BLANK_TEMPLATE_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"/></head>
+<body>
+  <h1>{{ engagement.name }}</h1>
+  <h2>{{ engagement.client_name }}</h2>
+
+  {% for finding in findings %}
+    <h3>{{ finding.vulnerability_name }} ({{ finding.severity }})</h3>
+    <p>{{ finding.description }}</p>
+  {% endfor %}
+</body>
+</html>`;
+
 export default function AdminReportTemplates() {
   const { data: templates = [], isLoading } = useReportTemplates();
   const upload   = useUploadLogo();
+  const del      = useDeleteReportTemplate();
   const qc       = useQueryClient();
   const fileRefs = useRef<Record<number, HTMLInputElement | null>>({});
+  const [editing, setEditing] = useState<number | 'new' | null>(null);
 
   async function handleLogoUpload(templateId: number, file: File) {
     try {
@@ -37,15 +56,33 @@ export default function AdminReportTemplates() {
     }
   }
 
+  async function handleDelete(templateId: number, name: string) {
+    if (!confirm(`Delete template "${name}"? Any engagement using it will fall back ` +
+                'to the system default. This cannot be undone.')) return;
+    try {
+      await del.mutateAsync(templateId);
+    } catch (e: unknown) {
+      alert(e instanceof Error ? e.message : 'Delete failed');
+    }
+  }
+
+  if (editing !== null) {
+    return <TemplateEditor templateId={editing} onClose={() => setEditing(null)} />;
+  }
+
   return (
     <>
       <div className="topbar">
         <div>
           <h1>Report Templates</h1>
           <div className="sub">
-            Manage PDF report branding. Upload a logo to any template and set one as the system default.
+            Manage PDF report branding and content. Upload a logo, edit the
+            HTML/Jinja2 body, and set one template as the system default.
           </div>
         </div>
+        <button className="btn btn-primary" onClick={() => setEditing('new')}>
+          + New Template
+        </button>
       </div>
 
       {isLoading ? (
@@ -53,7 +90,7 @@ export default function AdminReportTemplates() {
       ) : templates.length === 0 ? (
         <div className="card">
           <div className="empty" style={{ padding: '48px 20px' }}>
-            No report templates found. Templates are created automatically on first startup.
+            No report templates yet. Click "New Template" to create one.
           </div>
         </div>
       ) : (
@@ -92,7 +129,11 @@ export default function AdminReportTemplates() {
                 </div>
 
                 {/* Actions */}
-                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                  <button className="btn btn-ghost btn-sm" onClick={() => setEditing(t.id)}>
+                    Edit HTML
+                  </button>
+
                   {!t.is_default && (
                     <button className="btn btn-ghost btn-sm"
                             onClick={() => handleSetDefault(t.id)}>
@@ -124,6 +165,18 @@ export default function AdminReportTemplates() {
                       Remove Logo
                     </button>
                   )}
+
+                  <button
+                    className="btn btn-ghost btn-sm"
+                    style={{ color: t.is_default ? undefined : '#ef4444' }}
+                    disabled={t.is_default || del.isPending}
+                    title={t.is_default
+                      ? 'Set a different template as default before deleting this one'
+                      : undefined}
+                    onClick={() => handleDelete(t.id, t.name)}
+                  >
+                    Delete
+                  </button>
                 </div>
 
               </div>
@@ -138,6 +191,115 @@ export default function AdminReportTemplates() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+/* ── Create/edit HTML editor ─────────────────────────────────────────────── */
+function TemplateEditor({ templateId, onClose }: {
+  templateId: number | 'new'; onClose: () => void;
+}) {
+  const isNew  = templateId === 'new';
+  const { data: detail, isLoading } = useReportTemplateDetail(isNew ? null : templateId);
+  const create = useCreateReportTemplate();
+  const update = useUpdateReportTemplate(isNew ? -1 : templateId);
+
+  const [name, setName]         = useState('');
+  const [html, setHtml]         = useState(BLANK_TEMPLATE_HTML);
+  const [initialized, setInitialized] = useState(isNew);
+  const [error, setError]       = useState('');
+
+  // Populate the form once the existing template's detail has loaded —
+  // guarded by `initialized` so it doesn't stomp on in-progress edits if
+  // this component re-renders after a background refetch.
+  if (!isNew && detail && !initialized) {
+    setName(detail.name);
+    setHtml(detail.html_template);
+    setInitialized(true);
+  }
+
+  const saving = create.isPending || update.isPending;
+
+  async function save() {
+    setError('');
+    if (!name.trim()) { setError('Template name is required'); return; }
+    if (!html.trim()) { setError('Template HTML is required'); return; }
+    try {
+      if (isNew) {
+        await create.mutateAsync({ name: name.trim(), html_template: html });
+      } else {
+        await update.mutateAsync({ name: name.trim(), html_template: html });
+      }
+      onClose();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Save failed');
+    }
+  }
+
+  return (
+    <>
+      <div className="topbar">
+        <div>
+          <h1>{isNew ? 'New Report Template' : 'Edit Report Template'}</h1>
+          <div className="sub">
+            Raw HTML rendered through Jinja2, then to PDF via WeasyPrint. Syntax
+            is validated on save.
+          </div>
+        </div>
+        <div style={{ display:'flex', gap:8 }}>
+          <button className="btn btn-ghost" onClick={onClose}>Cancel</button>
+          <button className="btn btn-primary" onClick={save} disabled={saving || isLoading}>
+            {saving ? 'Saving…' : 'Save Template'}
+          </button>
+        </div>
+      </div>
+
+      {error && (
+        <div className="card" style={{ padding:'12px 16px', marginBottom:12,
+                                        color:'#ef4444', fontSize:13 }}>
+          {error}
+        </div>
+      )}
+
+      {!isNew && isLoading ? (
+        <div className="card"><div className="empty">Loading…</div></div>
+      ) : (
+        <div className="card" style={{ padding:24 }}>
+          <div style={{ marginBottom:16 }}>
+            <label style={{ display:'block', fontSize:12, fontWeight:600, marginBottom:6 }}>
+              Template Name
+            </label>
+            <input value={name} onChange={e => setName(e.target.value)}
+                  placeholder="e.g. Acme Corp Branded Report" />
+          </div>
+
+          <div style={{
+            fontSize:12, color:'var(--muted)', marginBottom:8, lineHeight:1.6,
+            background:'var(--surface2)', borderRadius:8, padding:'10px 14px',
+          }}>
+            Available in the template: <code>engagement</code> (name, client_name,
+            description, started_at, completed_at), <code>scans</code>,{' '}
+            <code>findings</code> (each with vulnerability_name, severity,
+            cvss_score, description, target_url, status, etc.),{' '}
+            <code>severity_counts</code>, <code>logo_b64</code>, <code>now</code>.
+            All values are auto-escaped.
+          </div>
+
+          <label style={{ display:'block', fontSize:12, fontWeight:600, marginBottom:6 }}>
+            HTML / Jinja2
+          </label>
+          <textarea
+            value={html}
+            onChange={e => setHtml(e.target.value)}
+            rows={24}
+            style={{
+              width:'100%', fontFamily:'monospace', fontSize:12.5,
+              resize:'vertical', boxSizing:'border-box', lineHeight:1.5,
+            }}
+            spellCheck={false}
+          />
         </div>
       )}
     </>

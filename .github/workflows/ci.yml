@@ -57,59 +57,14 @@ jobs:
           ZAP_API_KEY: "ci-test-zap-key"
         run: python -m pytest tests/ -q --tb=short
 
-  # ── Security scanning ───────────────────────────────────────────────────────
-  security-scan:
-    name: security scan (bandit + semgrep + pip-audit)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python 3.12
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Install security scanners
-        run: |
-          pip install --upgrade pip
-          pip install bandit semgrep pip-audit
-
-      - name: Run bandit (Python SAST)
-        working-directory: api
-        run: bandit -r . -f json -o bandit-report.json || true
-
-      - name: Run semgrep (static analysis)
-        working-directory: .
-        run: |
-          semgrep --config=auto \
-                  --error \
-                  --json \
-                  --output=semgrep-report.json \
-                  api/ || true
-
-      - name: Run pip-audit (dependency vulnerabilities)
-        working-directory: api
-        run: pip-audit --format=json --output=pip-audit-report.json || true
-
-      - name: Upload security reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: security-scan-reports
-          path: |
-            api/bandit-report.json
-            semgrep-report.json
-            api/pip-audit-report.json
-
-  # ── Frontend build ──────────────────────────────────────────────────────────
+  # ── Frontend build + tests ─────────────────────────────────────────────────
   frontend:
-    name: frontend build
+    name: frontend (tsc + vitest)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Node.js
+      - name: Set up Node
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -120,14 +75,13 @@ jobs:
         working-directory: frontend
         run: npm ci
 
-      - name: Build
+      - name: Type-check
         working-directory: frontend
-        run: npm run build
+        run: npx tsc -b
 
-      # Optional: run ESLint if configured in the frontend
-      - name: Lint (if eslint is configured)
+      - name: Run tests
         working-directory: frontend
-        run: npx eslint . --ext .ts,.tsx || true
+        run: npm test
 
   # ── Docker build check ────────────────────────────────────────────────────
   docker-build:

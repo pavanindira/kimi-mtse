@@ -21,7 +21,7 @@ from typing import List, Optional
 
 from sqlalchemy import (
     Boolean, CheckConstraint, DateTime, Float, ForeignKey, func, Index, Integer,
-    JSON, select, String, Text,
+    JSON, select, String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -61,7 +61,7 @@ class User(Base):
     username:      Mapped[str]          = mapped_column(String(100), unique=True, nullable=False)
     password_hash: Mapped[str]          = mapped_column(String(255), nullable=False)
     role:          Mapped[str]          = mapped_column(String(50), default='Analyst')
-    created_at:    Mapped[datetime]     = mapped_column(DateTime, default=func.now())
+    created_at:    Mapped[datetime]     = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     last_login:    Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     def __repr__(self) -> str:
@@ -89,9 +89,9 @@ class Engagement(Base):
     client_name:  Mapped[str]               = mapped_column(String(200), nullable=False)
     description:  Mapped[Optional[str]]     = mapped_column(Text, nullable=True)
     status:       Mapped[str]               = mapped_column(String(50), default='Active')
-    created_at:   Mapped[datetime]          = mapped_column(DateTime, default=func.now())
+    created_at:   Mapped[datetime]          = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at:   Mapped[datetime]          = mapped_column(
-        DateTime, default=func.now(), onupdate=func.now())
+        DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
     started_at:   Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_by:   Mapped[Optional[int]]     = mapped_column(
@@ -123,6 +123,38 @@ class Engagement(Base):
         return f'<Engagement {self.name} — {self.client_name}>'
 
 
+# ── Engagement Members ───────────────────────────────────────────────────────
+# Additional users granted access to an engagement beyond its creator
+# (Engagement.created_by). Membership grants the same per-engagement access
+# as ownership (see routers/engagements.py::_get_engagement_or_403) — it
+# does NOT grant additional global permissions, so a Viewer added as a
+# member gets read-only access to that engagement (Viewer-role-gated
+# endpoints still reject them), while an Analyst member gets full
+# read/write on it, same as if they owned it. Only the owner or an Admin
+# can add/remove members — a member cannot grant access to others.
+class EngagementMember(Base):
+    __tablename__ = 'engagement_members'
+    __table_args__ = (
+        UniqueConstraint('engagement_id', 'user_id', name='uq_engagement_member'),
+        Index('ix_engagement_members_engagement_id', 'engagement_id'),
+        Index('ix_engagement_members_user_id', 'user_id'),
+    )
+
+    id:            Mapped[int]      = mapped_column(Integer, primary_key=True)
+    engagement_id: Mapped[int]      = mapped_column(
+        Integer, ForeignKey('engagements.id', ondelete='CASCADE'), nullable=False)
+    user_id:       Mapped[int]      = mapped_column(
+        Integer, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    added_by:      Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey('users.id'), nullable=True)
+    created_at:    Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    user: Mapped[User] = relationship('User', foreign_keys=[user_id])
+
+    def __repr__(self) -> str:
+        return f'<EngagementMember engagement={self.engagement_id} user={self.user_id}>'
+
+
 # ── Scans ─────────────────────────────────────────────────────────────────────
 
 class Scan(Base):
@@ -143,7 +175,7 @@ class Scan(Base):
     status:         Mapped[str]          = mapped_column(String(50), default='Queued')
     celery_task_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     options:        Mapped[Optional[dict]] = mapped_column(JSON, default=dict)
-    created_at:     Mapped[datetime]     = mapped_column(DateTime, default=func.now())
+    created_at:     Mapped[datetime]     = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
     started_at:     Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     completed_at:   Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_by:     Mapped[Optional[int]] = mapped_column(
@@ -156,6 +188,52 @@ class Scan(Base):
 
     def __repr__(self) -> str:
         return f'<Scan {self.scan_id} [{self.scan_type}] {self.target}>'
+
+
+# ── Scheduled Scans ──────────────────────────────────────────────────────────
+# Recurring scans, dispatched by a periodic Celery Beat task
+# (tasks.py::run_scheduled_scans) rather than a one-off API-triggered scan.
+#
+# Recurrence is a plain interval (hours) rather than cron syntax — a
+# dropdown of common intervals (daily/weekly/monthly) plus a custom-hours
+# option covers the vast majority of "rescan this periodically" use cases
+# without needing a cron expression parser/validator in both the API and
+# the frontend.
+class ScheduledScan(Base):
+    __tablename__ = 'scheduled_scans'
+    __table_args__ = (
+        Index('ix_scheduled_scans_engagement_id', 'engagement_id'),
+        Index('ix_scheduled_scans_next_run_at',   'next_run_at'),
+    )
+
+    id:             Mapped[int]           = mapped_column(Integer, primary_key=True)
+    engagement_id:  Mapped[int]           = mapped_column(
+        Integer, ForeignKey('engagements.id', ondelete='CASCADE'), nullable=False)
+    scan_type:      Mapped[str]           = mapped_column(String(20), nullable=False)
+    target:         Mapped[str]           = mapped_column(String(500), nullable=False)
+    interval_hours: Mapped[int]           = mapped_column(Integer, nullable=False)
+    enabled:        Mapped[bool]          = mapped_column(Boolean, default=True)
+    # Same shape as Scan.options (auth_header, proxy, enable_katana/sqlmap/
+    # stealth) — git_token is deliberately NOT in here; see
+    # git_token_encrypted below for why it needs different handling.
+    options:        Mapped[Optional[dict]] = mapped_column(JSON, default=dict)
+    # Fernet-encrypted (crypto_utils.py) — unlike a one-off scan's git_token,
+    # a recurring scan needs this available on every future run, so it has
+    # to be persisted somewhere. Encrypted rather than plaintext; never
+    # returned by any API response (see ScheduledScanOut).
+    git_token_encrypted: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    next_run_at:    Mapped[datetime]      = mapped_column(DateTime, nullable=False)
+    last_run_at:    Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_scan_id:   Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    created_by:     Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey('users.id'), nullable=True)
+    created_at:     Mapped[datetime]      = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc))
+
+    engagement: Mapped[Engagement] = relationship('Engagement')
+
+    def __repr__(self) -> str:
+        return f'<ScheduledScan {self.scan_type} {self.target} every {self.interval_hours}h>'
 
 
 # ── Findings ──────────────────────────────────────────────────────────────────
@@ -197,21 +275,12 @@ class Finding(Base):
     status:             Mapped[str]           = mapped_column(String(50), default='Open')
     analyst_notes:      Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     dedup_hash:         Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    tool_count:         Mapped[int]           = mapped_column(Integer, default=1)
-    # ── Assignment & SLA ───────────────────────────────────────────────────────
-    assigned_to:        Mapped[Optional[int]] = mapped_column(
-        Integer, ForeignKey('users.id'), nullable=True, index=True)
-    due_date:           Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    # ── External ticket tracking ───────────────────────────────────────────────
-    external_ticket_id:  Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    external_ticket_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
-    first_seen:         Mapped[datetime]      = mapped_column(DateTime, default=func.now())
-    last_seen:          Mapped[datetime]      = mapped_column(DateTime, default=func.now())
+    first_seen:         Mapped[datetime]      = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    last_seen:          Mapped[datetime]      = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     scan:     Mapped[Scan]              = relationship('Scan', back_populates='findings')
     evidence: Mapped[List[Evidence]]   = relationship('Evidence', back_populates='finding',
                                                        cascade='all, delete-orphan')
-    assignee: Mapped[Optional[User]]   = relationship('User', foreign_keys=[assigned_to])
 
     def __repr__(self) -> str:
         return f'<Finding [{self.severity}] {self.vulnerability_name}>'
@@ -236,7 +305,7 @@ class Evidence(Base):
     label:      Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     content:    Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     file_path:  Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
-    created_at: Mapped[datetime]      = mapped_column(DateTime, default=func.now())
+    created_at: Mapped[datetime]      = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     finding: Mapped[Finding] = relationship('Finding', back_populates='evidence')
 
@@ -254,10 +323,53 @@ class ReportTemplate(Base):
     html_template: Mapped[str]           = mapped_column(Text, nullable=False)
     logo_base64:   Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     is_default:    Mapped[bool]          = mapped_column(Boolean, default=False)
-    created_at:    Mapped[datetime]      = mapped_column(DateTime, default=func.now())
+    created_at:    Mapped[datetime]      = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
     def __repr__(self) -> str:
         return f'<ReportTemplate {self.name}>'
+
+
+# ── Webhook Deliveries ───────────────────────────────────────────────────────
+# Delivery history for engagement webhooks — dispatch itself is fire-and-
+# forget (see tasks.py::_dispatch_webhook), but without a record of attempts
+# a failing receiver would fail silently forever. Capped at
+# MAX_DELIVERIES_PER_ENGAGEMENT rows per engagement (pruned on insert, see
+# routers/engagements.py / tasks.py) rather than a separate cleanup job —
+# this is diagnostic history, not an audit trail, so unbounded retention
+# isn't the goal.
+MAX_DELIVERIES_PER_ENGAGEMENT = 20
+
+
+class WebhookDelivery(Base):
+    __tablename__ = 'webhook_deliveries'
+    __table_args__ = (
+        Index('ix_webhook_deliveries_engagement_id', 'engagement_id'),
+        Index('ix_webhook_deliveries_created_at',    'created_at'),
+    )
+
+    id:               Mapped[int]           = mapped_column(Integer, primary_key=True)
+    engagement_id:    Mapped[int]           = mapped_column(
+        Integer, ForeignKey('engagements.id', ondelete='CASCADE'), nullable=False)
+    scan_id:          Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # 'scan.completed' for real dispatches, 'webhook.test' for the on-demand
+    # test-ping endpoint — scan_id is NULL for the latter.
+    event:            Mapped[str]           = mapped_column(String(50), nullable=False)
+    url:              Mapped[str]           = mapped_column(String(500), nullable=False)
+    success:          Mapped[bool]          = mapped_column(Boolean, nullable=False)
+    status_code:      Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Populated on a network-level failure (timeout, DNS, connection refused)
+    # — None when a response was received, even a non-2xx one (that's
+    # reflected in `success`/`status_code` instead).
+    error:            Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # First 500 chars only — this is for "did the receiver understand it",
+    # not for storing arbitrary receiver responses long-term.
+    response_snippet: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    duration_ms:      Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at:       Mapped[datetime]      = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc))
+
+    def __repr__(self) -> str:
+        return f'<WebhookDelivery engagement={self.engagement_id} success={self.success}>'
 
 
 # ── Audit Log ─────────────────────────────────────────────────────────────────
@@ -271,7 +383,7 @@ class AuditLog(Base):
 
     id:          Mapped[int]              = mapped_column(Integer, primary_key=True)
     timestamp:   Mapped[datetime]         = mapped_column(
-        DateTime, default=func.now(), nullable=False)
+        DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     user_id:     Mapped[Optional[int]]    = mapped_column(
         Integer, ForeignKey('users.id'), nullable=True)
     username:    Mapped[Optional[str]]    = mapped_column(String(100), nullable=True)
@@ -286,54 +398,3 @@ class AuditLog(Base):
 
     def __repr__(self) -> str:
         return f'<AuditLog {self.action} by {self.username} @ {self.timestamp}>'
-
-
-# ── Integration Config (Jira, ServiceNow, etc.) ─────────────────────────────────
-
-class IntegrationConfig(Base):
-    __tablename__ = 'integration_configs'
-    __table_args__ = (
-        Index('ix_integration_configs_engagement', 'engagement_id'),
-    )
-
-    id:            Mapped[int]           = mapped_column(Integer, primary_key=True)
-    engagement_id: Mapped[int]           = mapped_column(
-        Integer, ForeignKey('engagements.id'), nullable=False)
-    provider:      Mapped[str]           = mapped_column(String(50), nullable=False)
-    # e.g. 'jira', 'servicenow', 'azure_devops'
-    base_url:      Mapped[str]           = mapped_column(String(500), nullable=False)
-    # Token / API key — stored encrypted at the application level, not here.
-    # The raw token is encrypted with a per-instance Fernet key derived from
-    # JWT_SECRET so that a DB dump alone cannot decrypt credentials.
-    auth_token_encrypted: Mapped[str]   = mapped_column(String(500), nullable=False)
-    project_key:   Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    # Jira project key, ServiceNow table name, etc.
-    is_active:     Mapped[bool]          = mapped_column(Boolean, default=True)
-    created_at:    Mapped[datetime]      = mapped_column(DateTime, default=func.now())
-
-    engagement: Mapped[Engagement] = relationship('Engagement')
-
-
-# ── Notifications (in-app) ──────────────────────────────────────────────────────
-
-class Notification(Base):
-    __tablename__ = 'notifications'
-    __table_args__ = (
-        Index('ix_notifications_user_id', 'user_id'),
-        Index('ix_notifications_created_at', 'created_at'),
-    )
-
-    id:         Mapped[int]           = mapped_column(Integer, primary_key=True)
-    user_id:    Mapped[int]           = mapped_column(
-        Integer, ForeignKey('users.id'), nullable=False)
-    event_type: Mapped[str]           = mapped_column(String(80), nullable=False)
-    # e.g. 'scan.completed', 'finding.assigned', 'sla.breach'
-    title:      Mapped[str]           = mapped_column(String(255), nullable=False)
-    message:    Mapped[str]           = mapped_column(Text, nullable=False)
-    link:       Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
-    # URL path fragment the user should navigate to, e.g. '/findings/123'
-    is_read:    Mapped[bool]          = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime]      = mapped_column(DateTime, default=func.now())
-
-    user: Mapped[User] = relationship('User')
-

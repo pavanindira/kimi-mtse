@@ -5,8 +5,10 @@ import os
 import re
 import secrets
 import subprocess
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy import func, select
@@ -14,14 +16,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import AdminUser, AnalystUser, CurrentUser
 from database import get_db
-from models import Engagement, Finding, ReportTemplate, Scan
-from schemas import (EngagementCreate, EngagementDetail, EngagementOut,
-                     EngagementUpdate, FindingDelta, FindingOut,
-                     ReportTemplateOut, ScanCreate, ScanOut, SeveritySummary,
+from crypto_utils import encrypt_secret
+from models import (Engagement, EngagementMember, Finding,
+                    MAX_DELIVERIES_PER_ENGAGEMENT, ReportTemplate, Scan,
+                    ScheduledScan, User, WebhookDelivery)
+from schemas import (EngagementCreate, EngagementDetail, EngagementMemberCreate,
+                     EngagementMemberOut, EngagementOut, EngagementUpdate,
+                     FindingDelta, FindingOut, ReportTemplateOut, ScanCreate,
+                     ScanOut, ScheduledScanCreate, ScheduledScanOut,
+                     ScheduledScanUpdate, SeveritySummary, WebhookDeliveryOut,
                      WebhookSecretOut)
 from tasks import (celery, run_cloud_scan, run_infra_scan, run_mobile_scan,
                    run_sast_scan, run_web_scan)
-from utils import add_audit_log, get_client_ip
+from utils import add_audit_log, get_client_ip, user_has_engagement_access
+from webhooks import serialize_payload, sign_payload
 
 
 def _gen_webhook_secret() -> str:
@@ -93,24 +101,51 @@ async def _get_engagement_or_403(
 ) -> Engagement:
     """
     Fetch an engagement by id.  Raises 404 if it does not exist.
-    Raises 403 if the caller is not Admin and did not create the engagement.
+    Raises 403 if the caller is not Admin, did not create the engagement,
+    and is not a member of it (see EngagementMember in models.py).
 
-    Using 403 (not 404) for ownership violations is intentional — returning
+    Using 403 (not 404) for access violations is intentional — returning
     404 would reveal whether the engagement exists to a user who has no right
     to see it.  We reveal a 403 so the caller knows the ID is valid but they
     lack access, which is the appropriate signal for a UI to show.
+
+    Membership grants the same per-engagement access as ownership, but not
+    additional global permissions — a Viewer member still can't hit an
+    AnalystUser-gated endpoint (PATCH/DELETE), since that dependency
+    rejects them before this function is even called. This function only
+    answers "does this specific user have any standing on this specific
+    engagement", not "what are they allowed to do here".
+
+    The actual access check (owner/admin/member) lives in
+    utils.py::user_has_engagement_access, shared with findings.py — a
+    finding or scan doesn't have its own ownership, it inherits the
+    engagement's, so both routers need identical answers here.
     """
     eng = (await db.execute(
         select(Engagement).where(Engagement.id == eng_id)
     )).scalar_one_or_none()
     if not eng:
         raise HTTPException(status_code=404, detail='Engagement not found')
-    if current_user.role != 'Admin' and eng.created_by != current_user.id:
+    if not await user_has_engagement_access(db, eng_id, current_user):
         raise HTTPException(
             status_code=403,
             detail='You do not have access to this engagement',
         )
     return eng
+
+
+def _require_owner_or_admin(eng: Engagement, current_user) -> None:
+    """
+    Membership management is deliberately narrower than general engagement
+    access — any member can read/write the engagement itself, but only the
+    owner or an Admin can decide who else gets that access. Without this, a
+    member could add arbitrary other people to an engagement they don't own.
+    """
+    if current_user.role != 'Admin' and eng.created_by != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail='Only the engagement owner or an Admin can manage members',
+        )
 
 
 
@@ -140,11 +175,17 @@ async def list_engagements(
 ):
     """
     Admins see all engagements.
-    Analysts and Viewers see only engagements they created.
+    Analysts and Viewers see engagements they created or are a member of.
     """
     q = select(Engagement).order_by(Engagement.updated_at.desc())
     if current_user.role != 'Admin':
-        q = q.where(Engagement.created_by == current_user.id)
+        member_eng_ids = select(EngagementMember.engagement_id).where(
+            EngagementMember.user_id == current_user.id
+        )
+        q = q.where(
+            (Engagement.created_by == current_user.id) |
+            (Engagement.id.in_(member_eng_ids))
+        )
     if status:
         q = q.where(Engagement.status == status)
     result = await db.execute(q)
@@ -335,6 +376,261 @@ async def start_scan(
     return out
 
 
+# ── Scheduled scans ───────────────────────────────────────────────────────────
+# Recurring dispatch happens in tasks.py::run_scheduled_scans, a periodic
+# Celery Beat task (see celery.conf.beat_schedule there) — these endpoints
+# only manage the ScheduledScan config rows.
+
+@router.get('/{eng_id}/scheduled-scans', response_model=list[ScheduledScanOut])
+async def list_scheduled_scans(
+    eng_id:       int,
+    current_user: AnalystUser,
+    db:           AsyncSession = Depends(get_db),
+):
+    eng = await _get_engagement_or_403(eng_id, current_user, db)
+    rows = (await db.execute(
+        select(ScheduledScan).where(ScheduledScan.engagement_id == eng.id)
+        .order_by(ScheduledScan.created_at.desc())
+    )).scalars().all()
+    return [ScheduledScanOut.from_orm_obj(r) for r in rows]
+
+
+@router.post('/{eng_id}/scheduled-scans', response_model=ScheduledScanOut,
+            status_code=status.HTTP_201_CREATED)
+async def create_scheduled_scan(
+    eng_id:       int,
+    body:         ScheduledScanCreate,
+    request:      Request,
+    current_user: AnalystUser,
+    db:           AsyncSession = Depends(get_db),
+):
+    """
+    Create a recurring scan. Target/scan_type validation (SSRF blocklist,
+    per-type format) is inherited from ScanCreate and runs once here — the
+    periodic dispatch task trusts an already-validated target on every
+    future run, same as a one-off scan isn't re-validated at execution time.
+
+    The scope-mismatch check is advisory here too, same as start_scan, but
+    only surfaced at creation — nobody's watching a 3am scheduled run to see
+    a warning, so it wouldn't help there, only at setup time.
+    """
+    eng = await _get_engagement_or_403(eng_id, current_user, db)
+
+    scope_warning: str | None = None
+    if eng.scope:
+        scope_lines = [s.strip() for s in eng.scope.splitlines() if s.strip()]
+        if not _target_in_scope(body.target, scope_lines):
+            scope_warning = (
+                f'WARNING: Target "{body.target}" does not match any declared '
+                f'scope entry for this engagement. Proceed only if this is intentional.'
+            )
+
+    now = datetime.now(timezone.utc)
+    next_run = now if body.run_immediately else now + timedelta(hours=body.interval_hours)
+
+    sched = ScheduledScan(
+        engagement_id=eng_id, scan_type=body.scan_type, target=body.target,
+        interval_hours=body.interval_hours, enabled=True,
+        options={
+            'auth_header':    body.auth_header,
+            'proxy':          body.proxy,
+            'enable_katana':  body.enable_katana,
+            'enable_sqlmap':  body.enable_sqlmap,
+            'enable_stealth': body.enable_stealth,
+        },
+        git_token_encrypted=encrypt_secret(body.git_token) if body.git_token else None,
+        next_run_at=next_run, created_by=current_user.id,
+    )
+    db.add(sched)
+    await db.flush()
+
+    add_audit_log(db, action='scheduled_scan.created',
+                  user_id=current_user.id, username=current_user.username,
+                  target_type='scheduled_scan', target_id=sched.id, target_name=body.target,
+                  detail={'scan_type': body.scan_type, 'interval_hours': body.interval_hours},
+                  ip_address=get_client_ip(request))
+
+    out = ScheduledScanOut.from_orm_obj(sched)
+    if scope_warning:
+        return JSONResponse(
+            status_code=201,
+            content={**out.model_dump(mode='json'), 'scope_warning': scope_warning},
+        )
+    return out
+
+
+@router.patch('/{eng_id}/scheduled-scans/{sched_id}', response_model=ScheduledScanOut)
+async def update_scheduled_scan(
+    eng_id:       int,
+    sched_id:     int,
+    body:         ScheduledScanUpdate,
+    request:      Request,
+    current_user: AnalystUser,
+    db:           AsyncSession = Depends(get_db),
+):
+    """Pause/resume (enabled) or change the interval. Target/scan_type are
+    immutable here — see ScheduledScanUpdate's docstring for why."""
+    eng = await _get_engagement_or_403(eng_id, current_user, db)
+    sched = (await db.execute(
+        select(ScheduledScan).where(ScheduledScan.id == sched_id,
+                                    ScheduledScan.engagement_id == eng.id)
+    )).scalar_one_or_none()
+    if not sched:
+        raise HTTPException(status_code=404, detail='Scheduled scan not found')
+
+    changed: dict = {}
+    if body.enabled is not None:
+        changed['enabled'] = body.enabled
+    if body.interval_hours is not None:
+        changed['interval_hours'] = body.interval_hours
+        # Re-anchor next_run_at to the new interval from now, rather than
+        # leaving a next_run_at computed under the old interval — changing
+        # "every 24h" to "every 1h" should take effect soon, not after
+        # whatever was left of the old 24h window.
+        changed['next_run_at'] = datetime.now(timezone.utc) + timedelta(hours=body.interval_hours)
+
+    if not changed:
+        return ScheduledScanOut.from_orm_obj(sched)
+
+    for field, value in changed.items():
+        setattr(sched, field, value)
+
+    add_audit_log(db, action='scheduled_scan.updated',
+                  user_id=current_user.id, username=current_user.username,
+                  target_type='scheduled_scan', target_id=sched.id, target_name=sched.target,
+                  detail={k: v for k, v in changed.items() if k != 'next_run_at'},
+                  ip_address=get_client_ip(request))
+
+    await db.flush()
+    return ScheduledScanOut.from_orm_obj(sched)
+
+
+@router.delete('/{eng_id}/scheduled-scans/{sched_id}', status_code=status.HTTP_204_NO_CONTENT)
+async def delete_scheduled_scan(
+    eng_id:       int,
+    sched_id:     int,
+    request:      Request,
+    current_user: AnalystUser,
+    db:           AsyncSession = Depends(get_db),
+):
+    eng = await _get_engagement_or_403(eng_id, current_user, db)
+    sched = (await db.execute(
+        select(ScheduledScan).where(ScheduledScan.id == sched_id,
+                                    ScheduledScan.engagement_id == eng.id)
+    )).scalar_one_or_none()
+    if not sched:
+        raise HTTPException(status_code=404, detail='Scheduled scan not found')
+
+    add_audit_log(db, action='scheduled_scan.deleted',
+                  user_id=current_user.id, username=current_user.username,
+                  target_type='scheduled_scan', target_id=sched.id, target_name=sched.target,
+                  ip_address=get_client_ip(request))
+    await db.delete(sched)
+
+
+# ── Engagement members ────────────────────────────────────────────────────────
+# Additional users granted access to this engagement beyond its creator.
+# See models.py::EngagementMember and _require_owner_or_admin above for the
+# access-control design.
+
+@router.get('/{eng_id}/members', response_model=list[EngagementMemberOut])
+async def list_engagement_members(
+    eng_id:       int,
+    current_user: CurrentUser,
+    db:           AsyncSession = Depends(get_db),
+):
+    """Any member/owner/admin can see who else has access — visibility into
+    who can see an engagement is not itself sensitive the way granting
+    access is (that's gated separately, see add/remove below)."""
+    eng = await _get_engagement_or_403(eng_id, current_user, db)
+    rows = (await db.execute(
+        select(EngagementMember, User.username, User.role)
+        .join(User, User.id == EngagementMember.user_id)
+        .where(EngagementMember.engagement_id == eng.id)
+        .order_by(EngagementMember.created_at)
+    )).all()
+    return [
+        EngagementMemberOut(id=m.id, user_id=m.user_id, username=username,
+                            role=role, added_at=m.created_at)
+        for m, username, role in rows
+    ]
+
+
+@router.post('/{eng_id}/members', response_model=EngagementMemberOut,
+            status_code=status.HTTP_201_CREATED)
+async def add_engagement_member(
+    eng_id:       int,
+    body:         EngagementMemberCreate,
+    request:      Request,
+    current_user: AnalystUser,
+    db:           AsyncSession = Depends(get_db),
+):
+    eng = await _get_engagement_or_403(eng_id, current_user, db)
+    _require_owner_or_admin(eng, current_user)
+
+    user = (await db.execute(
+        select(User).where(User.username == body.username)
+    )).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail='User not found')
+    if user.id == eng.created_by:
+        raise HTTPException(status_code=400,
+                            detail='This user already owns the engagement')
+
+    existing = (await db.execute(
+        select(EngagementMember).where(
+            EngagementMember.engagement_id == eng.id,
+            EngagementMember.user_id == user.id,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(status_code=409, detail='User is already a member')
+
+    member = EngagementMember(engagement_id=eng.id, user_id=user.id,
+                              added_by=current_user.id)
+    db.add(member)
+    await db.flush()
+
+    add_audit_log(db, action='engagement.member_added',
+                  user_id=current_user.id, username=current_user.username,
+                  target_type='engagement', target_id=eng.id, target_name=eng.name,
+                  detail={'added_username': user.username}, ip_address=get_client_ip(request))
+
+    return EngagementMemberOut(id=member.id, user_id=user.id, username=user.username,
+                               role=user.role, added_at=member.created_at)
+
+
+@router.delete('/{eng_id}/members/{user_id}', status_code=status.HTTP_204_NO_CONTENT)
+async def remove_engagement_member(
+    eng_id:       int,
+    user_id:      int,
+    request:      Request,
+    current_user: AnalystUser,
+    db:           AsyncSession = Depends(get_db),
+):
+    eng = await _get_engagement_or_403(eng_id, current_user, db)
+    _require_owner_or_admin(eng, current_user)
+
+    member = (await db.execute(
+        select(EngagementMember).where(
+            EngagementMember.engagement_id == eng.id,
+            EngagementMember.user_id == user_id,
+        )
+    )).scalar_one_or_none()
+    if not member:
+        raise HTTPException(status_code=404, detail='Member not found')
+
+    removed_user = (await db.execute(
+        select(User.username).where(User.id == user_id)
+    )).scalar_one_or_none()
+
+    add_audit_log(db, action='engagement.member_removed',
+                  user_id=current_user.id, username=current_user.username,
+                  target_type='engagement', target_id=eng.id, target_name=eng.name,
+                  detail={'removed_username': removed_user}, ip_address=get_client_ip(request))
+    await db.delete(member)
+
+
 # ── Report ────────────────────────────────────────────────────────────────────
 
 @router.get('/{eng_id}/report')
@@ -465,6 +761,100 @@ async def rotate_webhook_secret(
                   ip_address=get_client_ip(request))
     await db.flush()
     return WebhookSecretOut(webhook_secret=eng.webhook_secret)
+
+
+# ── Webhook delivery history ─────────────────────────────────────────────────
+
+@router.get('/{eng_id}/webhook-deliveries', response_model=list[WebhookDeliveryOut])
+async def list_webhook_deliveries(
+    eng_id:       int,
+    current_user: AnalystUser,
+    db:           AsyncSession = Depends(get_db),
+):
+    """
+    Recent webhook delivery attempts — both real scan.completed dispatches
+    and on-demand webhook.test pings — most recent first. Capped at
+    MAX_DELIVERIES_PER_ENGAGEMENT rows (see models.py); this is diagnostic
+    history for the Settings tab, not an audit trail.
+    """
+    eng = await _get_engagement_or_403(eng_id, current_user, db)
+    rows = (await db.execute(
+        select(WebhookDelivery)
+        .where(WebhookDelivery.engagement_id == eng.id)
+        .order_by(WebhookDelivery.created_at.desc())
+        .limit(MAX_DELIVERIES_PER_ENGAGEMENT)
+    )).scalars().all()
+    return rows
+
+
+@router.post('/{eng_id}/webhook-test', response_model=WebhookDeliveryOut)
+async def test_webhook(
+    eng_id:       int,
+    current_user: AnalystUser,
+    db:           AsyncSession = Depends(get_db),
+):
+    """
+    Send a one-off test payload to the configured webhook_url immediately,
+    so whoever's setting this up can verify their receiver works without
+    waiting for a real scan to finish. Recorded to webhook_deliveries like
+    any other dispatch (event='webhook.test', scan_id=None), signed the
+    same way via webhooks.sign_payload — see that module's docstring for
+    why the signing logic is shared with tasks.py rather than reimplemented
+    here.
+
+    Uses httpx (async) rather than the `requests` library tasks.py uses —
+    this runs in the FastAPI event loop, where a blocking call would stall
+    other requests being served concurrently; tasks.py runs in a separate
+    sync Celery worker process where that concern doesn't apply.
+    """
+    eng = await _get_engagement_or_403(eng_id, current_user, db)
+    if not eng.webhook_url:
+        raise HTTPException(status_code=400, detail='No webhook_url configured')
+
+    payload = {
+        'event':         'webhook.test',
+        'engagement_id': eng.id,
+        'message':       'This is a test delivery from MSTE — no scan was actually run.',
+        'sent_at':       datetime.now(timezone.utc).isoformat(),
+    }
+    raw_body = serialize_payload(payload)
+    headers  = {'Content-Type': 'application/json'}
+    if eng.webhook_secret:
+        headers.update(sign_payload(eng.webhook_secret, raw_body))
+
+    success, status_code, error, response_snippet = False, None, None, None
+    start = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=5, follow_redirects=False) as client:
+            resp = await client.post(eng.webhook_url, content=raw_body, headers=headers)
+        status_code      = resp.status_code
+        success          = 200 <= resp.status_code < 300
+        response_snippet = resp.text[:500] if resp.text else None
+    except Exception as exc:
+        error = str(exc)[:2000]
+    duration_ms = int((time.monotonic() - start) * 1000)
+
+    delivery = WebhookDelivery(
+        engagement_id=eng.id, scan_id=None, event='webhook.test',
+        url=eng.webhook_url, success=success, status_code=status_code,
+        error=error, response_snippet=response_snippet, duration_ms=duration_ms,
+    )
+    db.add(delivery)
+
+    # Same prune-on-insert policy as tasks.py::_dispatch_webhook.
+    old_ids = (await db.execute(
+        select(WebhookDelivery.id)
+        .where(WebhookDelivery.engagement_id == eng.id)
+        .order_by(WebhookDelivery.created_at.desc())
+        .offset(MAX_DELIVERIES_PER_ENGAGEMENT)
+    )).scalars().all()
+    if old_ids:
+        await db.execute(
+            WebhookDelivery.__table__.delete().where(WebhookDelivery.id.in_(old_ids))
+        )
+
+    await db.flush()
+    return delivery
 
 
 # ── Delete engagement ─────────────────────────────────────────────────────────

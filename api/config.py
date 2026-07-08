@@ -55,6 +55,21 @@ class Settings(BaseSettings):
     def cors_origins_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(',')]
 
+    # ── Trusted proxies (comma-separated IPs/CIDRs) ────────────────────────────
+    # X-Forwarded-For is attacker-controlled unless the immediate TCP peer is
+    # a proxy you actually run — anyone can send that header directly.
+    # Empty by default: get_client_ip() ignores X-Forwarded-For entirely and
+    # uses the raw connection IP until this is set. If MSTE sits behind
+    # nginx (the default docker-compose setup), set this to nginx's address
+    # on the internal network — e.g. the service name resolves at runtime,
+    # so use the compose network's subnet (typically 172.16.0.0/12 covers
+    # Docker's default bridge pools) or nginx's specific container IP.
+    trusted_proxies: str = ''
+
+    @property
+    def trusted_proxies_list(self) -> list[str]:
+        return [p.strip() for p in self.trusted_proxies.split(',') if p.strip()]
+
     # ── Testing flag ──────────────────────────────────────────────────────────
     testing: bool = False
 

@@ -83,6 +83,7 @@ export interface EngagementOut {
   scope:              string | null;
   webhook_url:        string | null;
   report_template_id: number | null;
+  created_by:         number | null;
   created_at:         string | null;
   updated_at:         string | null;
   started_at:         string | null;
@@ -108,6 +109,53 @@ export interface ScanOut {
   completed_at:   string | null;
   finding_count:  number;
   scope_warning?: string | null;
+}
+
+export interface ScheduledScanOut {
+  id:             number;
+  scan_type:      string;
+  target:         string;
+  interval_hours: number;
+  enabled:        boolean;
+  next_run_at:    string | null;
+  last_run_at:    string | null;
+  last_scan_id:   string | null;
+  created_at:     string | null;
+  has_git_token:  boolean;
+  scope_warning?: string | null;
+}
+
+export interface EngagementMemberOut {
+  id:       number;
+  user_id:  number;
+  username: string;
+  role:     string;
+  added_at: string | null;
+}
+
+export interface FindingsTrendPoint {
+  week_start: string;
+  Critical:   number;
+  High:       number;
+  Medium:     number;
+  Low:        number;
+  Info:       number;
+}
+
+export interface ScansTrendPoint {
+  week_start: string;
+  total:      number;
+  completed:  number;
+  failed:     number;
+}
+
+export interface DashboardTrends {
+  days:                    number;
+  findings_by_week:        FindingsTrendPoint[];
+  scans_by_week:           ScansTrendPoint[];
+  open_severity_snapshot:  { Critical: number; High: number; Medium: number; Low: number; Info: number };
+  resolved_count:          number;
+  avg_days_to_resolve:     number | null;
 }
 
 export interface EvidenceOut {
@@ -173,8 +221,25 @@ export interface ReportTemplateOut {
   created_at: string | null;
 }
 
+export interface ReportTemplateDetail extends ReportTemplateOut {
+  html_template: string;
+}
+
 export interface WebhookSecretOut {
   webhook_secret: string;
+}
+
+export interface WebhookDeliveryOut {
+  id:               number;
+  scan_id:          string | null;
+  event:            string;
+  url:              string;
+  success:          boolean;
+  status_code:      number | null;
+  error:            string | null;
+  response_snippet: string | null;
+  duration_ms:      number | null;
+  created_at:       string | null;
 }
 
 export interface AuditLogOut {
@@ -268,6 +333,44 @@ export const engagements = {
       }),
   },
 
+  webhookDeliveries: {
+    list: (id: number) =>
+      apiFetch<WebhookDeliveryOut[]>(`/engagements/${id}/webhook-deliveries`),
+    test: (id: number) =>
+      apiFetch<WebhookDeliveryOut>(`/engagements/${id}/webhook-test`, { method: 'POST' }),
+  },
+
+  scheduledScans: {
+    list: (id: number) =>
+      apiFetch<ScheduledScanOut[]>(`/engagements/${id}/scheduled-scans`),
+    create: (id: number, body: {
+      scan_type: string; target: string; interval_hours: number;
+      run_immediately?: boolean; auth_header?: string; proxy?: string;
+      git_token?: string; enable_katana?: boolean; enable_sqlmap?: boolean;
+      enable_stealth?: boolean;
+    }) =>
+      apiFetch<ScheduledScanOut>(`/engagements/${id}/scheduled-scans`, {
+        method: 'POST', body: JSON.stringify(body),
+      }),
+    update: (id: number, schedId: number, body: { enabled?: boolean; interval_hours?: number }) =>
+      apiFetch<ScheduledScanOut>(`/engagements/${id}/scheduled-scans/${schedId}`, {
+        method: 'PATCH', body: JSON.stringify(body),
+      }),
+    delete: (id: number, schedId: number) =>
+      apiFetch<void>(`/engagements/${id}/scheduled-scans/${schedId}`, { method: 'DELETE' }),
+  },
+
+  members: {
+    list: (id: number) =>
+      apiFetch<EngagementMemberOut[]>(`/engagements/${id}/members`),
+    add: (id: number, username: string) =>
+      apiFetch<EngagementMemberOut>(`/engagements/${id}/members`, {
+        method: 'POST', body: JSON.stringify({ username }),
+      }),
+    remove: (id: number, userId: number) =>
+      apiFetch<void>(`/engagements/${id}/members/${userId}`, { method: 'DELETE' }),
+  },
+
   delete: (id: number) =>
     apiFetch<void>(`/engagements/${id}`, { method: 'DELETE' }),
 
@@ -358,6 +461,14 @@ export const search = {
 };
 
 
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+
+export const dashboard = {
+  trends: (days = 90) =>
+    apiFetch<DashboardTrends>(`/dashboard/trends?days=${days}`),
+};
+
+
 // ── Admin ─────────────────────────────────────────────────────────────────────
 
 export const admin = {
@@ -386,6 +497,18 @@ export const admin = {
 
   reportTemplates: {
     list:      () => apiFetch<ReportTemplateOut[]>('/admin/report-templates'),
+    get:       (templateId: number) =>
+      apiFetch<ReportTemplateDetail>(`/admin/report-templates/${templateId}`),
+    create:    (body: { name: string; html_template: string }) =>
+      apiFetch<ReportTemplateDetail>('/admin/report-templates', {
+        method: 'POST', body: JSON.stringify(body),
+      }),
+    update:    (templateId: number, body: { name?: string; html_template?: string }) =>
+      apiFetch<ReportTemplateDetail>(`/admin/report-templates/${templateId}`, {
+        method: 'PATCH', body: JSON.stringify(body),
+      }),
+    delete:    (templateId: number) =>
+      apiFetch<void>(`/admin/report-templates/${templateId}`, { method: 'DELETE' }),
     uploadLogo: (templateId: number, file: File) => {
       const fd = new FormData();
       fd.append('file', file);
@@ -400,17 +523,4 @@ export const admin = {
         method: 'PATCH',
       }),
   },
-};
-
-
-// ── Generic API helper (for endpoints not yet in typed modules) ─────────────────
-
-export const api = {
-  get:   <T>(path: string, opts?: { params?: Record<string, any> }) => {
-    const qs = opts?.params ? '?' + new URLSearchParams(opts.params).toString() : '';
-    return apiFetch<T>(path + qs, { method: 'GET' });
-  },
-  post:   <T>(path: string, body?: any) => apiFetch<T>(path, { method: 'POST',  body: JSON.stringify(body) }),
-  patch:  <T>(path: string, body?: any) => apiFetch<T>(path, { method: 'PATCH', body: JSON.stringify(body) }),
-  delete: <T>(path: string)             => apiFetch<T>(path, { method: 'DELETE' }),
 };

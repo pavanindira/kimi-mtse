@@ -38,6 +38,12 @@ services:
       - ZAP_API_URL=http://owasp-zap:8080
       - HOST_PROJECT_PATH=${HOST_PROJECT_PATH:?}
       - CORS_ORIGINS=https://${DOMAIN:-localhost}
+      # Compose doesn't pin a subnet for the default bridge network, so this
+      # covers Docker's entire default bridge pool (172.17.0.0/16 through
+      # 172.31.0.0/16) rather than a single guessed CIDR. Anyone running a
+      # custom `networks:` block with a pinned subnet should narrow this to
+      # match. See config.py::trusted_proxies for what this gates.
+      - TRUSTED_PROXIES=172.16.0.0/12
     env_file: .env
     volumes:
       - scan-artifacts:/app/targets

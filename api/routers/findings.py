@@ -11,14 +11,45 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import AnalystUser, CurrentUser
-from utils import add_audit_log, get_client_ip
+from utils import add_audit_log, get_client_ip, user_has_engagement_access
 from config import settings
 from database import get_db, AsyncSessionLocal
-from models import Engagement, Finding, Scan
-from schemas import (BulkStatusUpdate, EvidenceOut, FindingAssignmentUpdate, FindingDetail,
-                     FindingNotesUpdate, FindingOut, FindingStatusUpdate,
+from models import Engagement, EngagementMember, Finding, Scan
+from schemas import (BulkStatusUpdate, EvidenceOut, FindingDetail, FindingOut,
+                     FindingNotesUpdate, FindingStatusUpdate,
                      ManualFindingCreate, PaginatedFindings)
 router = APIRouter(tags=['findings'])
+
+
+async def _get_finding_scan_and_check_access(
+    db: AsyncSession, finding: Finding, current_user,
+) -> Scan | None:
+    """
+    Resolve a finding's parent Scan (if any) and verify current_user has
+    access to the engagement it belongs to. Raises 403 if not.
+
+    Shared by every per-finding endpoint below — get_finding, update_finding,
+    update_finding_notes, and the finding_ids collected in
+    bulk_update_findings all need the identical check, and before this
+    helper existed several of them didn't have it at all (see
+    utils.py::user_has_engagement_access's docstring for the history).
+
+    Returns None (rather than raising) for a finding with no scan_id_fk
+    (manually-created findings may lack one) — callers that need the scan
+    for other reasons should check for that themselves; callers that only
+    care about access can treat None as "nothing to check against" and rely
+    on Admin-only manual-finding creation paths elsewhere already being
+    gated correctly.
+    """
+    if not finding.scan_id_fk:
+        return None
+    scan = (await db.execute(
+        select(Scan).where(Scan.id == finding.scan_id_fk)
+    )).scalar_one_or_none()
+    if scan and not await user_has_engagement_access(db, scan.engagement_id, current_user):
+        raise HTTPException(status_code=403,
+                            detail='You do not have access to this finding')
+    return scan
 
 
 # ── List findings ─────────────────────────────────────────────────────────────
@@ -51,8 +82,12 @@ async def list_findings(
     def _base_q():
         q = select(Finding).join(Scan, Finding.scan_id_fk == Scan.id)
         if current_user.role != 'Admin':
+            member_eng_ids = select(EngagementMember.engagement_id).where(
+                EngagementMember.user_id == current_user.id
+            )
             q = q.join(Engagement, Scan.engagement_id == Engagement.id).where(
-                Engagement.created_by == current_user.id
+                (Engagement.created_by == current_user.id) |
+                (Engagement.id.in_(member_eng_ids))
             )
         if severity:      q = q.where(Finding.severity    == severity)
         if status:        q = q.where(Finding.status      == status)
@@ -119,6 +154,8 @@ async def get_finding(
     if not finding:
         raise HTTPException(status_code=404, detail='Finding not found')
 
+    scan = await _get_finding_scan_and_check_access(db, finding, current_user)
+
     # Build the base finding fields from FindingOut first,
     # then extend with evidence and scan context.
     # We can't use FindingDetail.model_validate directly because the
@@ -132,13 +169,9 @@ async def get_finding(
         evidence=[EvidenceOut.model_validate(ev) for ev in raw_ev],
     )
 
-    if finding.scan_id_fk:
-        scan = (await db.execute(
-            select(Scan).where(Scan.id == finding.scan_id_fk)
-        )).scalar_one_or_none()
-        if scan:
-            out.scan_id       = scan.scan_id
-            out.engagement_id = scan.engagement_id
+    if scan:
+        out.scan_id       = scan.scan_id
+        out.engagement_id = scan.engagement_id
 
     return out
 
@@ -160,6 +193,7 @@ async def update_finding(
     finding = result.scalar_one_or_none()
     if not finding:
         raise HTTPException(status_code=404, detail='Finding not found')
+    await _get_finding_scan_and_check_access(db, finding, current_user)
 
     old_status     = finding.status
     finding.status = body.status
@@ -176,77 +210,37 @@ async def update_finding(
     return finding
 
 
-@router.patch('/api/findings/{finding_id}/assign', response_model=FindingOut)
-async def assign_finding(
+@router.patch('/api/findings/{finding_id}/notes', response_model=FindingOut)
+async def update_finding_notes(
     finding_id:   int,
-    body:         FindingAssignmentUpdate,
+    body:         FindingNotesUpdate,
     current_user: AnalystUser,
     request:      Request,
     db:           AsyncSession = Depends(get_db),
 ):
-    """Assign a finding to a user and optionally set a due date."""
+    """
+    Update analyst notes on a finding without changing its status.
+
+    Notes support markdown. Use for confirming exploitability, recording
+    false-positive rationale, or linking remediation tickets.
+    """
     result = await db.execute(
         select(Finding).where(Finding.id == finding_id)
     )
     finding = result.scalar_one_or_none()
     if not finding:
         raise HTTPException(status_code=404, detail='Finding not found')
+    await _get_finding_scan_and_check_access(db, finding, current_user)
 
-    finding.assigned_to = body.assigned_to
-    if body.due_date is not None:
-        finding.due_date = body.due_date
-    finding.last_seen = datetime.now(timezone.utc)
+    finding.analyst_notes = body.notes
+    finding.last_seen     = datetime.now(timezone.utc)
 
-    # If assigned to someone, create a notification for them
-    if body.assigned_to and body.assigned_to != current_user.id:
-        from notifications import create_notification
-        await create_notification(
-            db, user_id=body.assigned_to,
-            event_type='finding.assigned',
-            title=f'Finding assigned: {finding.vulnerability_name}',
-            message=(f'You have been assigned a {finding.severity} finding: '
-                     f'{finding.vulnerability_name}'),
-            link=f'/findings/{finding.id}',
-        )
-
-    add_audit_log(db, action='finding.assigned',
+    add_audit_log(db, action='finding.notes_updated',
                   user_id=current_user.id, username=current_user.username,
                   target_type='finding', target_id=finding.id,
                   target_name=finding.vulnerability_name,
-                  detail={'assigned_to': body.assigned_to, 'due_date': body.due_date.isoformat() if body.due_date else None},
                   ip_address=get_client_ip(request))
     return finding
-
-
-@router.get('/api/findings/my', response_model=PaginatedFindings)
-async def my_findings(
-    current_user: CurrentUser,
-    db:           AsyncSession = Depends(get_db),
-    status:       str | None = None,
-    severity:     str | None = None,
-    limit:        int = 200,
-    offset:       int = 0,
-):
-    """List findings assigned to the current user."""
-    clamped_limit = min(max(limit, 1), 500)
-
-    q = select(Finding).where(Finding.assigned_to == current_user.id)
-    if status:   q = q.where(Finding.status == status)
-    if severity: q = q.where(Finding.severity == severity)
-
-    total = (await db.execute(
-        select(func.count()).select_from(q.subquery())
-    )).scalar_one()
-
-    items = (await db.execute(
-        q.order_by(Finding.due_date.asc().nulls_last(), Finding.cvss_score.desc().nulls_last())
-         .limit(clamped_limit).offset(offset)
-    )).scalars().all()
-
-    pages = max(1, -(-total // clamped_limit))
-    return PaginatedFindings(
-        total=total, items=items, limit=clamped_limit, offset=offset, pages=pages,
-    )
 
 
 @router.post('/api/scans/{scan_id}/findings',
@@ -273,6 +267,9 @@ async def create_manual_finding(
     )).scalar_one_or_none()
     if not scan:
         raise HTTPException(status_code=404, detail='Scan not found')
+    if not await user_has_engagement_access(db, scan.engagement_id, current_user):
+        raise HTTPException(status_code=403,
+                            detail='You do not have access to this scan')
 
     dedup_hash = hashlib.sha256(
         f"Manual:{body.vulnerability_name}:{body.location or ''}".encode()
@@ -320,24 +317,46 @@ async def bulk_update_findings(
     request:      Request,
     db:           AsyncSession = Depends(get_db),
 ):
+    """
+    Previously updated by raw `Finding.id IN (...)` with no ownership check
+    at all — any Analyst could mass-update any finding across the entire
+    deployment by passing arbitrary IDs, regardless of which engagement it
+    belonged to. Now scoped to findings whose scan's engagement the caller
+    owns, is a member of, or (for Admin) unconditionally. `updated` in the
+    response reflects rows actually matched, not len(finding_ids) — a
+    request naming some inaccessible IDs now silently updates only the
+    accessible subset rather than either updating everything or failing
+    the whole batch.
+    """
     vals: dict = {'status': body.status, 'last_seen': datetime.now(timezone.utc)}
     if body.notes:
         vals['analyst_notes'] = body.notes
 
-    await db.execute(
-        update(Finding)
-        .where(Finding.id.in_(body.finding_ids))
-        .values(**vals)
-    )
+    q = update(Finding).where(Finding.id.in_(body.finding_ids))
+    if current_user.role != 'Admin':
+        member_eng_ids = select(EngagementMember.engagement_id).where(
+            EngagementMember.user_id == current_user.id
+        )
+        accessible_scan_ids = (
+            select(Scan.id)
+            .join(Engagement, Scan.engagement_id == Engagement.id)
+            .where(
+                (Engagement.created_by == current_user.id) |
+                (Engagement.id.in_(member_eng_ids))
+            )
+        )
+        q = q.where(Finding.scan_id_fk.in_(accessible_scan_ids))
+    q = q.values(**vals)
 
-    ip = (request.headers.get('X-Forwarded-For', '').split(',')[0].strip()
-          or (request.client.host if request.client else None))
+    result = await db.execute(q)
+    updated_count = result.rowcount
+
     add_audit_log(db, action='finding.bulk_status_changed',
                   user_id=current_user.id, username=current_user.username,
                   detail={'ids': body.finding_ids, 'new_status': body.status,
-                          'count': len(body.finding_ids), 'notes': body.notes or None},
-                  ip_address=ip)
-    return {'success': True, 'updated': len(body.finding_ids),
+                          'count': updated_count, 'notes': body.notes or None},
+                  ip_address=get_client_ip(request))
+    return {'success': True, 'updated': updated_count,
             'status': body.status}
 
 
@@ -354,6 +373,9 @@ async def scan_status(
     )).scalar_one_or_none()
     if not scan:
         raise HTTPException(status_code=404, detail='Scan not found')
+    if not await user_has_engagement_access(db, scan.engagement_id, current_user):
+        raise HTTPException(status_code=403,
+                            detail='You do not have access to this scan')
 
     count = (await db.execute(
         select(func.count(Finding.id)).where(Finding.scan_id_fk == scan.id)
@@ -419,17 +441,9 @@ async def scan_stream(
     )).scalar_one_or_none()
     if not scan:
         raise HTTPException(status_code=404, detail='Scan not found')
-
-    # Verify the current user owns the engagement this scan belongs to
-    if current_user.role != 'Admin':
-        engagement = (await db.execute(
-            select(Engagement).where(Engagement.id == scan.engagement_id)
-        )).scalar_one_or_none()
-        if not engagement or engagement.created_by != current_user.id:
-            raise HTTPException(
-                status_code=403,
-                detail='You do not have access to this scan',
-            )
+    if not await user_has_engagement_access(db, scan.engagement_id, current_user):
+        raise HTTPException(status_code=403,
+                            detail='You do not have access to this scan')
 
     async def event_generator():
         redis  = aioredis.from_url(settings.redis_url, decode_responses=True)

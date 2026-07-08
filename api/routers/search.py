@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import CurrentUser
 from database import get_db
-from models import Engagement, Finding, Scan
+from models import Engagement, EngagementMember, Finding, Scan
 from schemas import SearchResults
 
 router = APIRouter(prefix='/api/search', tags=['search'])
@@ -25,15 +25,20 @@ async def global_search(
     pattern  = f'%{q}%'
     findings, engagements, scans = [], [], []
 
-    # Non-admins may only search within their own engagements.
+    # Non-admins may only search within engagements they own or are a member of.
     _owned_eng_ids: list[int] | None = None
     if current_user.role != 'Admin':
         rows = (await db.execute(
             select(Engagement.id).where(Engagement.created_by == current_user.id)
         )).all()
-        _owned_eng_ids = [r[0] for r in rows]
+        member_rows = (await db.execute(
+            select(EngagementMember.engagement_id).where(
+                EngagementMember.user_id == current_user.id
+            )
+        )).all()
+        _owned_eng_ids = list({r[0] for r in rows} | {r[0] for r in member_rows})
         if not _owned_eng_ids:
-            # User owns no engagements — nothing to search
+            # User has access to no engagements — nothing to search
             return SearchResults(query=q, total=0)
 
     if scope in ('all', 'findings'):
