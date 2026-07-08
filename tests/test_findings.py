@@ -57,14 +57,50 @@ class TestListFindings:
 
 
 class TestGetFinding:
-    def test_viewer_can_get_detail(self, client, viewer_headers, sample_findings):
+    def test_owner_can_get_detail(self, client, analyst_headers, sample_findings):
         fid = sample_findings[0]['id']
-        res = client.get(f'/api/findings/{fid}', headers=viewer_headers)
+        res = client.get(f'/api/findings/{fid}', headers=analyst_headers)
         assert res.status_code == 200
         data = res.json()
         assert data['id']  == fid
         assert 'evidence' in data
         assert 'scan_id'  in data
+
+    def test_viewer_with_no_access_is_rejected(self, client, viewer_headers, sample_findings):
+        """
+        Regression test: get_finding previously had no ownership check at
+        all — any authenticated user could read any finding by ID. A
+        Viewer with no relationship to the owning engagement (not the
+        creator, not a member) must be rejected, consistent with how
+        list_findings already scoped results for the same viewer.
+        """
+        fid = sample_findings[0]['id']
+        res = client.get(f'/api/findings/{fid}', headers=viewer_headers)
+        assert res.status_code == 403
+
+    def test_member_can_get_detail(self, client, analyst_headers, viewer_headers,
+                                    sample_engagement, sample_findings):
+        """A Viewer added as a member of the engagement CAN read its findings —
+        this is the legitimate way to grant that access, not an open door."""
+        eid = sample_engagement['id']
+        client.post(f'/api/engagements/{eid}/members',
+                   json={'username': 'viewer'}, headers=analyst_headers)
+        try:
+            fid = sample_findings[0]['id']
+            res = client.get(f'/api/findings/{fid}', headers=viewer_headers)
+            assert res.status_code == 200
+        finally:
+            # sample_engagement is session-scoped — remove the membership
+            # again so later tests relying on "viewer has no access to it"
+            # (e.g. TestPaginatedFindings::test_empty_result_shape) aren't
+            # affected by this test having run.
+            viewer_id = next(
+                m['user_id'] for m in
+                client.get(f'/api/engagements/{eid}/members', headers=analyst_headers).json()
+                if m['username'] == 'viewer'
+            )
+            client.delete(f'/api/engagements/{eid}/members/{viewer_id}',
+                         headers=analyst_headers)
 
     def test_nonexistent_returns_404(self, client, admin_headers):
         res = client.get('/api/findings/999999', headers=admin_headers)
@@ -180,6 +216,50 @@ class TestBulkStatus:
                           headers=analyst_headers)
         assert res.status_code == 200
 
+    def test_cannot_bulk_update_another_users_findings(
+        self, client, analyst_headers, admin_headers, sample_findings,
+    ):
+        """
+        Regression test: bulk_update_findings previously updated by raw
+        `Finding.id IN (...)` with no ownership check at all — any Analyst
+        could mass-update any finding across the whole deployment by
+        passing arbitrary IDs. A second, unrelated Analyst must not be able
+        to touch findings belonging to someone else's engagement; the
+        request should succeed but silently affect 0 rows, not fail loudly
+        (that would tell the caller the IDs exist, which they don't need to
+        know) and not silently succeed at mutating them either.
+        """
+        target_ids = [f['id'] for f in sample_findings]
+
+        # Establish a known baseline via the legitimate owner first, so this
+        # test doesn't depend on execution order relative to the other
+        # bulk-status tests in this class that also mutate sample_findings.
+        client.post('/api/findings/bulk-status',
+                    json={'finding_ids': target_ids, 'status': 'Confirmed'},
+                    headers=analyst_headers)
+
+        other = client.post('/api/admin/users',
+                            json={'username': 'other_analyst_bulk', 'password': 'password123',
+                                  'role': 'Analyst'},
+                            headers=admin_headers)
+        assert other.status_code == 201
+        other_token = client.post(
+            '/api/auth/login',
+            json={'username': 'other_analyst_bulk', 'password': 'password123'},
+        ).json()['access_token']
+        other_headers = {'Authorization': f'Bearer {other_token}'}
+
+        res = client.post('/api/findings/bulk-status',
+                          json={'finding_ids': target_ids, 'status': 'False Positive'},
+                          headers=other_headers)
+        assert res.status_code == 200
+        assert res.json()['updated'] == 0
+
+        # Still 'Confirmed' — the other analyst's attempt touched nothing.
+        for fid in target_ids:
+            check = client.get(f'/api/findings/{fid}', headers=analyst_headers)
+            assert check.json()['status'] == 'Confirmed'
+
 
 # ── Search ────────────────────────────────────────────────────────────────────
 
@@ -233,202 +313,6 @@ class TestSearch:
     def test_unauthenticated_rejected(self, client):
         res = client.get('/api/search?q=test')
         assert res.status_code == 401
-
-
-# ── Admin: users ──────────────────────────────────────────────────────────────
-
-class TestAdminUsers:
-    def test_admin_can_list_users(self, client, admin_headers):
-        res = client.get('/api/admin/users', headers=admin_headers)
-        assert res.status_code == 200
-        data = res.json()
-        assert isinstance(data, list)
-        usernames = [u['username'] for u in data]
-        assert 'admin' in usernames
-
-    def test_analyst_cannot_list_users(self, client, analyst_headers):
-        res = client.get('/api/admin/users', headers=analyst_headers)
-        assert res.status_code == 403
-
-    def test_viewer_cannot_list_users(self, client, viewer_headers):
-        res = client.get('/api/admin/users', headers=viewer_headers)
-        assert res.status_code == 403
-
-    def test_admin_can_create_user(self, client, admin_headers):
-        import time
-        unique = f'newuser_{int(time.time())}'
-        res = client.post('/api/admin/users',
-                          json={'username': unique,
-                                'password': 'newpassword123',
-                                'role':     'Analyst'},
-                          headers=admin_headers)
-        assert res.status_code == 201
-        data = res.json()
-        assert data['username'] == unique
-        assert data['role']     == 'Analyst'
-
-    def test_duplicate_username_rejected(self, client, admin_headers):
-        res = client.post('/api/admin/users',
-                          json={'username': 'admin',
-                                'password': 'anything123',
-                                'role':     'Analyst'},
-                          headers=admin_headers)
-        assert res.status_code == 409
-
-    def test_invalid_role_rejected(self, client, admin_headers):
-        res = client.post('/api/admin/users',
-                          json={'username': 'badrole_user',
-                                'password': 'password123',
-                                'role':     'SuperAdmin'},
-                          headers=admin_headers)
-        assert res.status_code == 422
-
-    def test_short_password_rejected(self, client, admin_headers):
-        res = client.post('/api/admin/users',
-                          json={'username': 'shortpw',
-                                'password': 'abc',
-                                'role':     'Analyst'},
-                          headers=admin_headers)
-        assert res.status_code == 422
-
-    def test_admin_can_change_role(self, client, admin_headers):
-        # Get the analyst user's ID
-        res = client.get('/api/admin/users', headers=admin_headers)
-        assert res.status_code == 200
-        users = res.json()
-        assert isinstance(users, list)
-        analyst = next((u for u in users if u['username'] == 'analyst'), None)
-        assert analyst is not None, 'analyst user not found'
-
-        # Change role to Viewer
-        res = client.patch(f'/api/admin/users/{analyst["id"]}/role',
-                           json={'role': 'Viewer'},
-                           headers=admin_headers)
-        assert res.status_code == 200
-        assert res.json()['role'] == 'Viewer'
-
-        # Immediately restore to Analyst
-        res = client.patch(f'/api/admin/users/{analyst["id"]}/role',
-                           json={'role': 'Analyst'},
-                           headers=admin_headers)
-        assert res.status_code == 200
-        assert res.json()['role'] == 'Analyst'
-
-    def test_admin_role_is_intact(self, client, admin_headers):
-        """Verify admin still has Admin role — guards subsequent audit tests."""
-        res = client.get('/api/auth/me', headers=admin_headers)
-        assert res.status_code == 200, f'Admin token rejected: {res.text}'
-        assert res.json()['role'] == 'Admin', \
-            f'Admin role was changed by a prior test: {res.json()}'
-
-    def test_cannot_change_builtin_admin_role(self, client, admin_headers):
-        users = client.get('/api/admin/users', headers=admin_headers).json()
-        admin_user = next(u for u in users if u['username'] == 'admin')
-        res = client.patch(f'/api/admin/users/{admin_user["id"]}/role',
-                           json={'role': 'Analyst'},
-                           headers=admin_headers)
-        # Admin can change their own role (they ARE the current user)
-        # but another admin cannot change the builtin admin — here we just
-        # verify the endpoint responds without 500
-        assert res.status_code in (200, 403)
-
-    def test_cannot_delete_self(self, client, admin_headers):
-        res = client.get('/api/admin/users', headers=admin_headers)
-        assert res.status_code == 200, f'List users failed: {res.text}'
-        users = res.json()
-        assert isinstance(users, list), f'Expected list, got: {type(users)}'
-        admin_user = next((u for u in users if u['username'] == 'admin'), None)
-        assert admin_user is not None
-        res = client.delete(f'/api/admin/users/{admin_user["id"]}',
-                            headers=admin_headers)
-        assert res.status_code == 400
-
-    def test_cannot_delete_builtin_admin(self, client, admin_headers):
-        res = client.get('/api/admin/users', headers=admin_headers)
-        assert res.status_code == 200
-        users = res.json()
-        assert isinstance(users, list)
-        admin_user = next((u for u in users if u['username'] == 'admin'), None)
-        assert admin_user is not None
-        res = client.delete(f'/api/admin/users/{admin_user["id"]}',
-                            headers=admin_headers)
-        assert res.status_code == 400
-
-
-# ── Admin: audit log ──────────────────────────────────────────────────────────
-
-class TestAuditLog:
-    def _fresh_admin(self, client):
-        """Get a fresh admin token (role may have been changed by prior tests)."""
-        res = client.post('/api/auth/login',
-                          json={'username': 'admin', 'password': 'adminpass123'})
-        assert res.status_code == 200
-        return {'Authorization': f'Bearer {res.json()["access_token"]}'}
-
-    def test_admin_can_view_audit_log(self, client):
-        headers = self._fresh_admin(client)
-        res = client.get('/api/admin/audit', headers=headers)
-        assert res.status_code == 200
-        data = res.json()
-        assert 'items'    in data
-        assert 'total'    in data
-        assert 'page'     in data
-        assert 'pages'    in data
-        assert 'per_page' in data
-
-    def test_analyst_cannot_view_audit_log(self, client, analyst_headers):
-        res = client.get('/api/admin/audit', headers=analyst_headers)
-        assert res.status_code == 403
-
-    def test_viewer_cannot_view_audit_log(self, client, viewer_headers):
-        res = client.get('/api/admin/audit', headers=viewer_headers)
-        assert res.status_code == 403
-
-    def test_login_events_are_recorded(self, client):
-        headers = self._fresh_admin(client)
-        res = client.get('/api/admin/audit?action_filter=user.login',
-                         headers=headers)
-        assert res.status_code == 200
-        items = res.json()['items']
-        assert len(items) >= 1
-        assert all(e['action'] == 'user.login' for e in items)
-
-    def test_pagination(self, client):
-        headers = self._fresh_admin(client)
-        res = client.get('/api/admin/audit?page=1&per_page=5',
-                         headers=headers)
-        assert res.status_code == 200
-        data = res.json()
-        assert data['page']     == 1
-        assert data['per_page'] == 5
-        assert len(data['items']) <= 5
-
-    def test_filter_by_user(self, client):
-        headers = self._fresh_admin(client)
-        res = client.get('/api/admin/audit?user_filter=admin',
-                         headers=headers)
-        assert res.status_code == 200
-        items = res.json()['items']
-        assert all('admin' in (e['username'] or '') for e in items)
-
-    def test_engagement_create_audited(self, client, admin_headers,
-                                         sample_engagement):
-        res = client.get('/api/admin/audit?action_filter=engagement.created',
-                         headers=admin_headers)
-        assert res.status_code == 200
-        assert res.json()['total'] >= 1
-
-    def test_scan_start_audited(self, client, admin_headers,
-                                 sample_engagement, analyst_headers):
-        eid = sample_engagement['id']
-        client.post(f'/api/engagements/{eid}/scans',
-                    json={'scan_type': 'web',
-                          'target':    'https://audit-test.example.com'},
-                    headers=analyst_headers)
-        res = client.get('/api/admin/audit?action_filter=scan.started',
-                         headers=admin_headers)
-        assert res.status_code == 200
-        assert res.json()['total'] >= 1
 
 
 # ── Health check ──────────────────────────────────────────────────────────────

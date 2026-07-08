@@ -291,10 +291,7 @@ async def render_engagement_report_async(engagement, db) -> bytes:
     # Pre-compute per-scan finding counts in a single query
     count_rows = (await db.execute(
         select(Finding.scan_id_fk, func.count(Finding.id))
-        .where(
-            Finding.scan_id_fk.in_([s.id for s in scan_rows]),
-            Finding.status.in_(['Open', 'Confirmed']),
-        )
+        .where(Finding.scan_id_fk.in_([s.id for s in scan_rows]))
         .group_by(Finding.scan_id_fk)
     )).all()
     finding_count_by_scan = {row[0]: row[1] for row in count_rows}
@@ -311,25 +308,7 @@ async def render_engagement_report_async(engagement, db) -> bytes:
     ]
 
     # ── Fetch open/confirmed findings with evidence eager-loaded ──────────────
-    # Safety limit: engagements with 10,000+ findings would exhaust memory
-    # during PDF generation.  Cap at 5,000 and log a warning so the operator
-    # knows the report is partial.
-    MAX_REPORT_FINDINGS = 5000
     scan_ids = [s.id for s in scan_rows]
-    total_finding_count = (await db.execute(
-        select(func.count(Finding.id))
-        .where(
-            Finding.scan_id_fk.in_(scan_ids),
-            Finding.status.in_(['Open', 'Confirmed']),
-        )
-    )).scalar_one()
-
-    if total_finding_count > MAX_REPORT_FINDINGS:
-        logger.warning(
-            'Engagement %s has %d findings; capping report at %d',
-            engagement.id, total_finding_count, MAX_REPORT_FINDINGS
-        )
-
     finding_rows = (await db.execute(
         select(Finding)
         .where(
@@ -337,12 +316,13 @@ async def render_engagement_report_async(engagement, db) -> bytes:
             Finding.status.in_(['Open', 'Confirmed']),
         )
         .options(selectinload(Finding.evidence))
-        .order_by(
-            Finding.severity,
-            Finding.cvss_score.desc().nulls_last(),
-        )
-        .limit(MAX_REPORT_FINDINGS)
     )).scalars().all()
+
+    severity_order = {s: i for i, s in enumerate(SEVERITIES)}
+    finding_rows.sort(key=lambda f: (
+        severity_order.get(f.severity, 99),
+        -(f.cvss_score or 0),
+    ))
 
     severity_counts = {s: 0 for s in SEVERITIES}
     findings_ctx = []

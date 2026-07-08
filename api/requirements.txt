@@ -5,6 +5,9 @@ python-multipart==0.0.12       # form parsing
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 python-jose[cryptography]==3.3.0   # JWT signing / verification
+cryptography==46.0.6           # explicit pin — used directly for scheduled-scan
+                                # credential encryption (crypto_utils.py), not just
+                                # transitively via python-jose's [cryptography] extra
 bcrypt==5.0.0                      # password hashing (imported directly, no passlib)
 
 # ── Database ──────────────────────────────────────────────────────────────────

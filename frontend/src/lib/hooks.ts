@@ -3,7 +3,7 @@
  */
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { admin, auth, engagements, findings, search } from './api';
+import { admin, auth, dashboard, engagements, findings, search } from './api';
 import type { FindingOut, PaginatedFindings } from './api';
 
 // ── Query keys ────────────────────────────────────────────────────────────────
@@ -20,6 +20,7 @@ export const QK = {
   users:       ['users']                             as const,
   audit:       (p: object)       => ['audit',       p]      as const,
   templates:   ['report-templates']                  as const,
+  templateDetail: (id: number)   => ['report-template', id] as const,
 };
 
 
@@ -98,6 +99,79 @@ export function useRevealWebhookSecret(engId: number) {
 export function useRotateWebhookSecret(engId: number) {
   return useMutation({
     mutationFn: () => engagements.webhookSecret.rotate(engId),
+  });
+}
+
+export function useWebhookDeliveries(engId: number, enabled: boolean) {
+  return useQuery({
+    queryKey: ['webhook-deliveries', engId],
+    queryFn:  () => engagements.webhookDeliveries.list(engId),
+    enabled,
+  });
+}
+
+export function useTestWebhook(engId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => engagements.webhookDeliveries.test(engId),
+    onSuccess:  () => qc.invalidateQueries({ queryKey: ['webhook-deliveries', engId] }),
+  });
+}
+
+export function useScheduledScans(engId: number) {
+  return useQuery({
+    queryKey: ['scheduled-scans', engId],
+    queryFn:  () => engagements.scheduledScans.list(engId),
+  });
+}
+
+export function useCreateScheduledScan(engId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: Parameters<typeof engagements.scheduledScans.create>[1]) =>
+      engagements.scheduledScans.create(engId, body),
+    onSuccess:  () => qc.invalidateQueries({ queryKey: ['scheduled-scans', engId] }),
+  });
+}
+
+export function useUpdateScheduledScan(engId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ schedId, body }: {
+      schedId: number; body: Parameters<typeof engagements.scheduledScans.update>[2];
+    }) => engagements.scheduledScans.update(engId, schedId, body),
+    onSuccess:  () => qc.invalidateQueries({ queryKey: ['scheduled-scans', engId] }),
+  });
+}
+
+export function useDeleteScheduledScan(engId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (schedId: number) => engagements.scheduledScans.delete(engId, schedId),
+    onSuccess:  () => qc.invalidateQueries({ queryKey: ['scheduled-scans', engId] }),
+  });
+}
+
+export function useEngagementMembers(engId: number) {
+  return useQuery({
+    queryKey: ['engagement-members', engId],
+    queryFn:  () => engagements.members.list(engId),
+  });
+}
+
+export function useAddEngagementMember(engId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (username: string) => engagements.members.add(engId, username),
+    onSuccess:  () => qc.invalidateQueries({ queryKey: ['engagement-members', engId] }),
+  });
+}
+
+export function useRemoveEngagementMember(engId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (userId: number) => engagements.members.remove(engId, userId),
+    onSuccess:  () => qc.invalidateQueries({ queryKey: ['engagement-members', engId] }),
   });
 }
 
@@ -300,5 +374,48 @@ export function useUploadLogo() {
     mutationFn: ({ templateId, file }: { templateId: number; file: File }) =>
       admin.reportTemplates.uploadLogo(templateId, file),
     onSuccess: () => qc.invalidateQueries({ queryKey: QK.templates }),
+  });
+}
+
+export function useReportTemplateDetail(templateId: number | null) {
+  return useQuery({
+    queryKey: QK.templateDetail(templateId ?? -1),
+    queryFn:  () => admin.reportTemplates.get(templateId as number),
+    enabled:  templateId !== null,
+  });
+}
+
+export function useCreateReportTemplate() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: admin.reportTemplates.create,
+    onSuccess:  () => qc.invalidateQueries({ queryKey: QK.templates }),
+  });
+}
+
+export function useUpdateReportTemplate(templateId: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: Parameters<typeof admin.reportTemplates.update>[1]) =>
+      admin.reportTemplates.update(templateId, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: QK.templates });
+      qc.invalidateQueries({ queryKey: QK.templateDetail(templateId) });
+    },
+  });
+}
+
+export function useDeleteReportTemplate() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (templateId: number) => admin.reportTemplates.delete(templateId),
+    onSuccess:  () => qc.invalidateQueries({ queryKey: QK.templates }),
+  });
+}
+
+export function useDashboardTrends(days = 90) {
+  return useQuery({
+    queryKey: ['dashboard-trends', days],
+    queryFn:  () => dashboard.trends(days),
   });
 }

@@ -1,5 +1,7 @@
 """test_engagements.py — Engagement CRUD and RBAC tests."""
 
+from unittest.mock import AsyncMock, MagicMock, patch
+
 import pytest
 
 
@@ -567,6 +569,458 @@ class TestWebhookSecret:
 
     def test_unauthenticated_rejected(self, client):
         res = client.get('/api/engagements/1/webhook-secret')
+        assert res.status_code == 401
+
+
+class TestWebhookDeliveries:
+    """Coverage for GET .../webhook-deliveries and POST .../webhook-test."""
+
+    def _make_engagement_with_webhook(self, client, analyst_headers):
+        res = client.post('/api/engagements',
+                          json={'name': 'Delivery Test Eng', 'client_name': 'Client',
+                                'webhook_url': 'https://hooks.example.com/mste'},
+                          headers=analyst_headers)
+        return res.json()['id']
+
+    def test_deliveries_empty_before_any_dispatch(self, client, analyst_headers):
+        eid = self._make_engagement_with_webhook(client, analyst_headers)
+        res = client.get(f'/api/engagements/{eid}/webhook-deliveries', headers=analyst_headers)
+        assert res.status_code == 200
+        assert res.json() == []
+
+    def test_test_ping_success_is_recorded(self, client, analyst_headers):
+        eid = self._make_engagement_with_webhook(client, analyst_headers)
+        fake_resp = MagicMock(status_code=200, text='ok')
+
+        with patch('httpx.AsyncClient.post', new_callable=AsyncMock, return_value=fake_resp):
+            res = client.post(f'/api/engagements/{eid}/webhook-test', headers=analyst_headers)
+
+        assert res.status_code == 200
+        body = res.json()
+        assert body['event'] == 'webhook.test'
+        assert body['scan_id'] is None
+        assert body['success'] is True
+        assert body['status_code'] == 200
+        assert body['error'] is None
+
+        listing = client.get(f'/api/engagements/{eid}/webhook-deliveries',
+                             headers=analyst_headers).json()
+        assert len(listing) == 1
+        assert listing[0]['event'] == 'webhook.test'
+
+    def test_test_ping_network_failure_is_recorded(self, client, analyst_headers):
+        eid = self._make_engagement_with_webhook(client, analyst_headers)
+
+        with patch('httpx.AsyncClient.post', new_callable=AsyncMock,
+                   side_effect=Exception('Connection refused')):
+            res = client.post(f'/api/engagements/{eid}/webhook-test', headers=analyst_headers)
+
+        assert res.status_code == 200  # the endpoint itself succeeds — the *delivery* failed
+        body = res.json()
+        assert body['success'] is False
+        assert body['status_code'] is None
+        assert 'Connection refused' in body['error']
+
+    def test_test_ping_non_2xx_marked_unsuccessful(self, client, analyst_headers):
+        eid = self._make_engagement_with_webhook(client, analyst_headers)
+        fake_resp = MagicMock(status_code=500, text='server error')
+
+        with patch('httpx.AsyncClient.post', new_callable=AsyncMock, return_value=fake_resp):
+            res = client.post(f'/api/engagements/{eid}/webhook-test', headers=analyst_headers)
+
+        body = res.json()
+        assert body['success'] is False
+        assert body['status_code'] == 500
+
+    def test_test_ping_requires_webhook_configured(self, client, analyst_headers):
+        create_res = client.post('/api/engagements',
+                                 json={'name': 'No Hook', 'client_name': 'Client'},
+                                 headers=analyst_headers)
+        eid = create_res.json()['id']
+        res = client.post(f'/api/engagements/{eid}/webhook-test', headers=analyst_headers)
+        assert res.status_code == 400
+
+    def test_deliveries_capped_at_max(self, client, analyst_headers):
+        eid = self._make_engagement_with_webhook(client, analyst_headers)
+        fake_resp = MagicMock(status_code=200, text='ok')
+        with patch('httpx.AsyncClient.post', new_callable=AsyncMock, return_value=fake_resp):
+            for _ in range(25):
+                client.post(f'/api/engagements/{eid}/webhook-test', headers=analyst_headers)
+
+        listing = client.get(f'/api/engagements/{eid}/webhook-deliveries',
+                             headers=analyst_headers).json()
+        assert len(listing) == 20  # MAX_DELIVERIES_PER_ENGAGEMENT
+
+    def test_non_owner_cannot_view_deliveries(self, client, analyst_headers, viewer_headers):
+        eid = self._make_engagement_with_webhook(client, analyst_headers)
+        res = client.get(f'/api/engagements/{eid}/webhook-deliveries', headers=viewer_headers)
+        assert res.status_code == 403
+
+    def test_non_owner_cannot_trigger_test_ping(self, client, analyst_headers, viewer_headers):
+        eid = self._make_engagement_with_webhook(client, analyst_headers)
+        res = client.post(f'/api/engagements/{eid}/webhook-test', headers=viewer_headers)
+        assert res.status_code == 403
+
+    def test_unauthenticated_rejected(self, client):
+        res = client.get('/api/engagements/1/webhook-deliveries')
+        assert res.status_code == 401
+
+
+class TestEngagementMembers:
+    """CRUD + RBAC coverage for /api/engagements/{id}/members."""
+
+    def test_owner_can_add_member(self, client, analyst_headers, viewer_headers,
+                                   sample_engagement):
+        eid = sample_engagement['id']
+        res = client.post(f'/api/engagements/{eid}/members',
+                          json={'username': 'viewer'}, headers=analyst_headers)
+        assert res.status_code == 201
+        assert res.json()['username'] == 'viewer'
+        assert res.json()['role'] == 'Viewer'
+
+        # cleanup — this fixture is session-scoped
+        member_id = res.json()['user_id']
+        client.delete(f'/api/engagements/{eid}/members/{member_id}', headers=analyst_headers)
+
+    def test_member_gains_access_to_engagement(self, client, analyst_headers,
+                                                viewer_headers, sample_engagement):
+        eid = sample_engagement['id']
+        # Before membership: no access.
+        before = client.get(f'/api/engagements/{eid}', headers=viewer_headers)
+        assert before.status_code == 403
+
+        add_res = client.post(f'/api/engagements/{eid}/members',
+                              json={'username': 'viewer'}, headers=analyst_headers)
+        member_id = add_res.json()['user_id']
+        try:
+            after = client.get(f'/api/engagements/{eid}', headers=viewer_headers)
+            assert after.status_code == 200
+        finally:
+            client.delete(f'/api/engagements/{eid}/members/{member_id}',
+                         headers=analyst_headers)
+            confirm = client.get(f'/api/engagements/{eid}', headers=viewer_headers)
+            assert confirm.status_code == 403
+
+    def test_member_appears_in_list_engagements(self, client, analyst_headers,
+                                                 viewer_headers, sample_engagement):
+        eid = sample_engagement['id']
+        add_res = client.post(f'/api/engagements/{eid}/members',
+                              json={'username': 'viewer'}, headers=analyst_headers)
+        member_id = add_res.json()['user_id']
+        try:
+            listing = client.get('/api/engagements', headers=viewer_headers).json()
+            assert any(e['id'] == eid for e in listing)
+        finally:
+            client.delete(f'/api/engagements/{eid}/members/{member_id}',
+                         headers=analyst_headers)
+
+    def test_cannot_add_nonexistent_user(self, client, analyst_headers, sample_engagement):
+        eid = sample_engagement['id']
+        res = client.post(f'/api/engagements/{eid}/members',
+                          json={'username': 'ghost_user_does_not_exist'},
+                          headers=analyst_headers)
+        assert res.status_code == 404
+
+    def test_cannot_add_duplicate_member(self, client, analyst_headers, sample_engagement):
+        eid = sample_engagement['id']
+        first = client.post(f'/api/engagements/{eid}/members',
+                            json={'username': 'viewer'}, headers=analyst_headers)
+        member_id = first.json()['user_id']
+        try:
+            dup = client.post(f'/api/engagements/{eid}/members',
+                              json={'username': 'viewer'}, headers=analyst_headers)
+            assert dup.status_code == 409
+        finally:
+            client.delete(f'/api/engagements/{eid}/members/{member_id}',
+                         headers=analyst_headers)
+
+    def test_cannot_add_the_owner_as_a_member(self, client, analyst_headers, sample_engagement):
+        eid = sample_engagement['id']
+        res = client.post(f'/api/engagements/{eid}/members',
+                          json={'username': 'analyst'}, headers=analyst_headers)
+        assert res.status_code == 400
+
+    def test_member_cannot_add_other_members(self, client, analyst_headers, viewer_headers,
+                                              admin_headers, sample_engagement):
+        """Only the owner or an Admin can manage membership — a member
+        cannot escalate by adding arbitrary other people."""
+        eid = sample_engagement['id']
+        add_res = client.post(f'/api/engagements/{eid}/members',
+                              json={'username': 'viewer'}, headers=analyst_headers)
+        member_id = add_res.json()['user_id']
+        try:
+            res = client.post(f'/api/engagements/{eid}/members',
+                              json={'username': 'admin'}, headers=viewer_headers)
+            assert res.status_code == 403
+        finally:
+            client.delete(f'/api/engagements/{eid}/members/{member_id}',
+                         headers=analyst_headers)
+
+    def test_non_owner_analyst_cannot_add_members(self, client, admin_headers,
+                                                    sample_engagement):
+        """An unrelated Analyst (not the owner, not Admin) can't manage
+        membership on someone else's engagement either."""
+        eid = sample_engagement['id']
+        other = client.post('/api/admin/users',
+                            json={'username': 'other_analyst_members', 'password': 'password123',
+                                  'role': 'Analyst'},
+                            headers=admin_headers)
+        assert other.status_code == 201
+        other_token = client.post(
+            '/api/auth/login',
+            json={'username': 'other_analyst_members', 'password': 'password123'},
+        ).json()['access_token']
+        other_headers = {'Authorization': f'Bearer {other_token}'}
+
+        res = client.post(f'/api/engagements/{eid}/members',
+                          json={'username': 'viewer'}, headers=other_headers)
+        assert res.status_code == 403
+
+    def test_admin_can_manage_members_on_any_engagement(self, client, admin_headers,
+                                                          sample_engagement):
+        eid = sample_engagement['id']
+        res = client.post(f'/api/engagements/{eid}/members',
+                          json={'username': 'viewer'}, headers=admin_headers)
+        assert res.status_code == 201
+        member_id = res.json()['user_id']
+        del_res = client.delete(f'/api/engagements/{eid}/members/{member_id}',
+                                headers=admin_headers)
+        assert del_res.status_code == 204
+
+    def test_list_members(self, client, analyst_headers, sample_engagement):
+        eid = sample_engagement['id']
+        add_res = client.post(f'/api/engagements/{eid}/members',
+                              json={'username': 'viewer'}, headers=analyst_headers)
+        member_id = add_res.json()['user_id']
+        try:
+            res = client.get(f'/api/engagements/{eid}/members', headers=analyst_headers)
+            assert res.status_code == 200
+            assert any(m['username'] == 'viewer' for m in res.json())
+        finally:
+            client.delete(f'/api/engagements/{eid}/members/{member_id}',
+                         headers=analyst_headers)
+
+    def test_member_can_view_member_list(self, client, analyst_headers, viewer_headers,
+                                          sample_engagement):
+        """Any member/owner/admin can see who else has access, even though
+        only the owner/admin can change it."""
+        eid = sample_engagement['id']
+        add_res = client.post(f'/api/engagements/{eid}/members',
+                              json={'username': 'viewer'}, headers=analyst_headers)
+        member_id = add_res.json()['user_id']
+        try:
+            res = client.get(f'/api/engagements/{eid}/members', headers=viewer_headers)
+            assert res.status_code == 200
+        finally:
+            client.delete(f'/api/engagements/{eid}/members/{member_id}',
+                         headers=analyst_headers)
+
+    def test_remove_nonexistent_member_404(self, client, analyst_headers, sample_engagement):
+        eid = sample_engagement['id']
+        res = client.delete(f'/api/engagements/{eid}/members/999999', headers=analyst_headers)
+        assert res.status_code == 404
+
+    def test_non_owner_cannot_list_members(self, client, viewer_headers, sample_engagement):
+        eid = sample_engagement['id']
+        res = client.get(f'/api/engagements/{eid}/members', headers=viewer_headers)
+        assert res.status_code == 403
+
+    def test_unauthenticated_rejected(self, client):
+        res = client.get('/api/engagements/1/members')
+        assert res.status_code == 401
+
+
+class TestScheduledScans:
+    """CRUD + RBAC coverage for /api/engagements/{id}/scheduled-scans.
+    Actual periodic dispatch (tasks.py::run_scheduled_scans) is a sync
+    Celery-context function verified separately outside pytest — see the
+    isolated verification scripts used during development, since tasks.py's
+    DB session is incompatible with this suite's async SQLite harness."""
+
+    def test_create_scheduled_scan(self, client, analyst_headers, sample_engagement):
+        eid = sample_engagement['id']
+        res = client.post(f'/api/engagements/{eid}/scheduled-scans',
+                          json={'scan_type': 'web', 'target': 'https://example.com',
+                                'interval_hours': 24},
+                          headers=analyst_headers)
+        assert res.status_code == 201
+        body = res.json()
+        assert body['scan_type'] == 'web'
+        assert body['interval_hours'] == 24
+        assert body['enabled'] is True
+        assert body['has_git_token'] is False
+        assert 'git_token' not in body
+        assert 'git_token_encrypted' not in body
+
+    def test_create_rejects_invalid_scan_type(self, client, analyst_headers, sample_engagement):
+        eid = sample_engagement['id']
+        res = client.post(f'/api/engagements/{eid}/scheduled-scans',
+                          json={'scan_type': 'nonsense', 'target': 'https://example.com',
+                                'interval_hours': 24},
+                          headers=analyst_headers)
+        assert res.status_code == 422
+
+    def test_create_rejects_interval_out_of_range(self, client, analyst_headers,
+                                                   sample_engagement):
+        eid = sample_engagement['id']
+        res = client.post(f'/api/engagements/{eid}/scheduled-scans',
+                          json={'scan_type': 'web', 'target': 'https://example.com',
+                                'interval_hours': 0},
+                          headers=analyst_headers)
+        assert res.status_code == 422
+
+    def test_create_rejects_ssrf_target(self, client, analyst_headers, sample_engagement):
+        """Inherited from ScanCreate's target validation — private/internal
+        addresses are blocked the same as for a one-off scan."""
+        eid = sample_engagement['id']
+        res = client.post(f'/api/engagements/{eid}/scheduled-scans',
+                          json={'scan_type': 'web', 'target': 'http://169.254.169.254/',
+                                'interval_hours': 24},
+                          headers=analyst_headers)
+        assert res.status_code == 422
+
+    def test_create_with_git_token_encrypts_it(self, client, analyst_headers, sample_engagement):
+        eid = sample_engagement['id']
+        res = client.post(f'/api/engagements/{eid}/scheduled-scans',
+                          json={'scan_type': 'sast', 'target': 'https://github.com/x/y.git',
+                                'interval_hours': 168, 'git_token': 'ghp_supersecrettoken'},
+                          headers=analyst_headers)
+        assert res.status_code == 201
+        assert res.json()['has_git_token'] is True
+        assert 'git_token' not in res.json()
+        assert 'ghp_supersecrettoken' not in res.text
+
+    def test_run_immediately_schedules_next_run_now(self, client, analyst_headers,
+                                                      sample_engagement):
+        eid = sample_engagement['id']
+        res = client.post(f'/api/engagements/{eid}/scheduled-scans',
+                          json={'scan_type': 'web', 'target': 'https://example.com',
+                                'interval_hours': 24, 'run_immediately': True},
+                          headers=analyst_headers)
+        assert res.status_code == 201
+        # next_run_at should be at/near now, not ~24h in the future.
+        from datetime import datetime, timezone
+        next_run = datetime.fromisoformat(res.json()['next_run_at'].replace('Z', '+00:00'))
+        assert (next_run - datetime.now(timezone.utc)).total_seconds() < 60
+
+    def test_scope_warning_surfaced_but_not_blocking(self, client, analyst_headers):
+        create_res = client.post('/api/engagements',
+                                 json={'name': 'Scoped Eng', 'client_name': 'Client',
+                                       'scope': '*.example.com'},
+                                 headers=analyst_headers)
+        eid = create_res.json()['id']
+        res = client.post(f'/api/engagements/{eid}/scheduled-scans',
+                          json={'scan_type': 'web', 'target': 'https://out-of-scope.test',
+                                'interval_hours': 24},
+                          headers=analyst_headers)
+        assert res.status_code == 201
+        assert 'scope_warning' in res.json()
+
+    def test_list_scheduled_scans(self, client, analyst_headers, sample_engagement):
+        eid = sample_engagement['id']
+        client.post(f'/api/engagements/{eid}/scheduled-scans',
+                    json={'scan_type': 'web', 'target': 'https://example.com',
+                          'interval_hours': 24},
+                    headers=analyst_headers)
+        res = client.get(f'/api/engagements/{eid}/scheduled-scans', headers=analyst_headers)
+        assert res.status_code == 200
+        assert len(res.json()) >= 1
+
+    def test_update_can_disable(self, client, analyst_headers, sample_engagement):
+        eid = sample_engagement['id']
+        create_res = client.post(f'/api/engagements/{eid}/scheduled-scans',
+                                 json={'scan_type': 'web', 'target': 'https://example.com',
+                                       'interval_hours': 24},
+                                 headers=analyst_headers)
+        sid = create_res.json()['id']
+        res = client.patch(f'/api/engagements/{eid}/scheduled-scans/{sid}',
+                           json={'enabled': False}, headers=analyst_headers)
+        assert res.status_code == 200
+        assert res.json()['enabled'] is False
+
+    def test_update_interval_re_anchors_next_run(self, client, analyst_headers,
+                                                  sample_engagement):
+        eid = sample_engagement['id']
+        create_res = client.post(f'/api/engagements/{eid}/scheduled-scans',
+                                 json={'scan_type': 'web', 'target': 'https://example.com',
+                                       'interval_hours': 720},
+                                 headers=analyst_headers)
+        sid = create_res.json()['id']
+        res = client.patch(f'/api/engagements/{eid}/scheduled-scans/{sid}',
+                           json={'interval_hours': 1}, headers=analyst_headers)
+        assert res.status_code == 200
+        assert res.json()['interval_hours'] == 1
+        from datetime import datetime, timezone
+        next_run = datetime.fromisoformat(res.json()['next_run_at'].replace('Z', '+00:00'))
+        # Re-anchored to ~1h away, not left at the old ~720h-away value.
+        assert (next_run - datetime.now(timezone.utc)).total_seconds() < 2 * 3600
+
+    def test_update_nonexistent_404(self, client, analyst_headers, sample_engagement):
+        eid = sample_engagement['id']
+        res = client.patch(f'/api/engagements/{eid}/scheduled-scans/999999',
+                           json={'enabled': False}, headers=analyst_headers)
+        assert res.status_code == 404
+
+    def test_delete_scheduled_scan(self, client, analyst_headers, sample_engagement):
+        eid = sample_engagement['id']
+        create_res = client.post(f'/api/engagements/{eid}/scheduled-scans',
+                                 json={'scan_type': 'web', 'target': 'https://example.com',
+                                       'interval_hours': 24},
+                                 headers=analyst_headers)
+        sid = create_res.json()['id']
+        res = client.delete(f'/api/engagements/{eid}/scheduled-scans/{sid}',
+                            headers=analyst_headers)
+        assert res.status_code == 204
+
+        listing = client.get(f'/api/engagements/{eid}/scheduled-scans',
+                             headers=analyst_headers).json()
+        assert not any(s['id'] == sid for s in listing)
+
+    def test_delete_nonexistent_404(self, client, analyst_headers, sample_engagement):
+        eid = sample_engagement['id']
+        res = client.delete(f'/api/engagements/{eid}/scheduled-scans/999999',
+                            headers=analyst_headers)
+        assert res.status_code == 404
+
+    def test_non_owner_cannot_create(self, client, viewer_headers, sample_engagement):
+        eid = sample_engagement['id']
+        res = client.post(f'/api/engagements/{eid}/scheduled-scans',
+                          json={'scan_type': 'web', 'target': 'https://example.com',
+                                'interval_hours': 24},
+                          headers=viewer_headers)
+        assert res.status_code == 403
+
+    def test_non_owner_cannot_list(self, client, viewer_headers, sample_engagement):
+        eid = sample_engagement['id']
+        res = client.get(f'/api/engagements/{eid}/scheduled-scans', headers=viewer_headers)
+        assert res.status_code == 403
+
+    def test_non_owner_cannot_update(self, client, analyst_headers, viewer_headers,
+                                      sample_engagement):
+        eid = sample_engagement['id']
+        create_res = client.post(f'/api/engagements/{eid}/scheduled-scans',
+                                 json={'scan_type': 'web', 'target': 'https://example.com',
+                                       'interval_hours': 24},
+                                 headers=analyst_headers)
+        sid = create_res.json()['id']
+        res = client.patch(f'/api/engagements/{eid}/scheduled-scans/{sid}',
+                           json={'enabled': False}, headers=viewer_headers)
+        assert res.status_code == 403
+
+    def test_non_owner_cannot_delete(self, client, analyst_headers, viewer_headers,
+                                      sample_engagement):
+        eid = sample_engagement['id']
+        create_res = client.post(f'/api/engagements/{eid}/scheduled-scans',
+                                 json={'scan_type': 'web', 'target': 'https://example.com',
+                                       'interval_hours': 24},
+                                 headers=analyst_headers)
+        sid = create_res.json()['id']
+        res = client.delete(f'/api/engagements/{eid}/scheduled-scans/{sid}',
+                            headers=viewer_headers)
+        assert res.status_code == 403
+
+    def test_unauthenticated_rejected(self, client):
+        res = client.get('/api/engagements/1/scheduled-scans')
         assert res.status_code == 401
 
 

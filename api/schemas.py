@@ -177,6 +177,31 @@ class WebhookSecretOut(BaseModel):
     webhook_secret: str
 
 
+class WebhookDeliveryOut(OrmModel):
+    id:               int
+    scan_id:          str | None
+    event:            str
+    url:              str
+    success:          bool
+    status_code:      int | None
+    error:            str | None
+    response_snippet: str | None
+    duration_ms:      int | None
+    created_at:       datetime | None
+
+
+class EngagementMemberOut(BaseModel):
+    id:         int
+    user_id:    int
+    username:   str
+    role:       str
+    added_at:   datetime | None
+
+
+class EngagementMemberCreate(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
+
+
 class ReportTemplateOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id:         int
@@ -197,12 +222,111 @@ class ReportTemplateOut(BaseModel):
         )
 
 
+class ReportTemplateDetail(ReportTemplateOut):
+    """
+    Adds the raw html_template — deliberately not on ReportTemplateOut, since
+    that's used for the list view (both admin.py's management page and
+    engagements.py's per-engagement picker) and there's no reason to ship a
+    potentially large HTML blob to every list request.
+    """
+    html_template: str
+
+    @classmethod
+    def from_orm_obj(cls, obj) -> 'ReportTemplateDetail':
+        return cls(
+            id            = obj.id,
+            name          = obj.name,
+            is_default    = obj.is_default,
+            has_logo      = bool(getattr(obj, 'logo_base64', None)),
+            created_at    = getattr(obj, 'created_at', None),
+            html_template = obj.html_template,
+        )
+
+
+def _validate_template_syntax(html: str) -> str:
+    """
+    Parse (don't render) the template to catch Jinja2 syntax errors at
+    save time rather than at PDF-export time, when the failure would
+    surface to whoever's exporting a report, not whoever wrote the
+    template.
+
+    This only checks syntax validity, not that referenced variables exist —
+    doing that would mean hardcoding the report context shape into schemas.py
+    and re-breaking every time report.py's context changes. A template that
+    references a typo'd variable will just render that section blank
+    (Jinja2's default undefined behavior) rather than failing, which is an
+    acceptable gap for an admin-authored, low-frequency-changed asset.
+    """
+    from jinja2 import Environment, TemplateSyntaxError
+    try:
+        Environment().parse(html)
+    except TemplateSyntaxError as exc:
+        raise ValueError(f'Invalid template syntax: {exc.message} (line {exc.lineno})')
+    return html
+
+
+class ReportTemplateCreate(BaseModel):
+    name:          str = Field(min_length=1, max_length=200)
+    html_template: str = Field(min_length=1, max_length=200_000)
+
+    @field_validator('html_template')
+    @classmethod
+    def check_syntax(cls, v: str) -> str:
+        return _validate_template_syntax(v)
+
+
+class ReportTemplateUpdate(BaseModel):
+    """Partial update — all fields optional. Only provided fields are changed."""
+    name:          str | None = Field(default=None, min_length=1, max_length=200)
+    html_template: str | None = Field(default=None, min_length=1, max_length=200_000)
+
+    @field_validator('html_template')
+    @classmethod
+    def check_syntax(cls, v: str | None) -> str | None:
+        return _validate_template_syntax(v) if v is not None else v
+
+
 class SeveritySummary(BaseModel):
     Critical: int = 0
     High:     int = 0
     Medium:   int = 0
     Low:      int = 0
     Info:     int = 0
+
+
+class FindingsTrendPoint(BaseModel):
+    week_start: str  # ISO date (Monday) of the week this bucket covers
+    Critical:   int = 0
+    High:       int = 0
+    Medium:     int = 0
+    Low:        int = 0
+    Info:       int = 0
+
+
+class ScansTrendPoint(BaseModel):
+    week_start: str
+    total:      int = 0
+    completed:  int = 0
+    failed:     int = 0
+
+
+class DashboardTrends(BaseModel):
+    """
+    avg_days_to_resolve is an approximation: findings have first_seen but no
+    dedicated resolved_at column, so this uses last_seen - first_seen for
+    findings currently in a terminal status (Fixed/False Positive) whose
+    last_seen falls in the requested window. If a finding's notes were
+    edited without changing status, last_seen moves without that being a
+    real resolution event, so this trends accurate over aggregates but
+    isn't a precise per-finding SLA measurement. None when there's no
+    resolved finding in the window to average.
+    """
+    days:                   int
+    findings_by_week:       list[FindingsTrendPoint]
+    scans_by_week:          list[ScansTrendPoint]
+    open_severity_snapshot: SeveritySummary
+    resolved_count:         int
+    avg_days_to_resolve:    float | None
 
 
 class EngagementOut(OrmModel):
@@ -214,6 +338,7 @@ class EngagementOut(OrmModel):
     scope:              str | None
     webhook_url:        str | None
     report_template_id: int | None
+    created_by:         int | None
     created_at:         datetime | None
     updated_at:         datetime | None
     started_at:         datetime | None
@@ -352,6 +477,62 @@ class ScanCreate(BaseModel):
         return self
 
 
+# Common interval choices for the frontend dropdown (not enforced here —
+# interval_hours accepts any value 1-8760, this is just the suggested set):
+# 1 = Hourly, 24 = Daily, 168 = Weekly, 720 = Monthly (30 days).
+
+
+class ScheduledScanCreate(ScanCreate):
+    """
+    Inherits scan_type/target validation (SSRF blocklist, per-type target
+    format) from ScanCreate — a recurring scan's target needs exactly the
+    same checks as a one-off one, run once at creation rather than on every
+    future dispatch (the periodic task trusts what was already validated
+    here, the same way a one-off scan's target isn't re-validated at
+    execution time either).
+    """
+    interval_hours:  int  = Field(ge=1, le=8760, description='Hours between runs (1-8760)')
+    run_immediately: bool = Field(
+        default=False,
+        description='If true, the first run is scheduled for now rather than one interval away')
+
+
+class ScheduledScanUpdate(BaseModel):
+    """Partial update. Changing target/scan_type isn't supported here —
+    delete and recreate instead, since that also forces re-validation of
+    the target against the (possibly changed) engagement scope."""
+    interval_hours: int | None = Field(default=None, ge=1, le=8760)
+    enabled:        bool | None = None
+
+
+class ScheduledScanOut(OrmModel):
+    id:             int
+    scan_type:      str
+    target:         str
+    interval_hours: int
+    enabled:        bool
+    next_run_at:    datetime | None
+    last_run_at:    datetime | None
+    last_scan_id:   str | None
+    created_at:     datetime | None
+    has_git_token:  bool = False
+
+    @classmethod
+    def from_orm_obj(cls, obj) -> 'ScheduledScanOut':
+        return cls(
+            id             = obj.id,
+            scan_type      = obj.scan_type,
+            target         = obj.target,
+            interval_hours = obj.interval_hours,
+            enabled        = obj.enabled,
+            next_run_at    = obj.next_run_at,
+            last_run_at    = obj.last_run_at,
+            last_scan_id   = obj.last_scan_id,
+            created_at     = obj.created_at,
+            has_git_token  = bool(obj.git_token_encrypted),
+        )
+
+
 class ScanOut(OrmModel):
     id:             int
     scan_id:        str
@@ -363,8 +544,8 @@ class ScanOut(OrmModel):
     created_at:     datetime | None
     started_at:     datetime | None
     completed_at:   datetime | None
-    # Populated by the bulk COUNT query in list_scans (engagements router) —
-    # not a SQLAlchemy column_property.  No manual setting required.
+    # Populated automatically from the Scan.finding_count column_property —
+    # no manual setting required in any router.
     finding_count:  int = 0
 
 
@@ -396,7 +577,6 @@ class FindingOut(OrmModel):
     remediation:        str | None
     status:             str
     analyst_notes:      str | None
-    tool_count:         int = 1
     first_seen:         datetime | None
     last_seen:          datetime | None
 

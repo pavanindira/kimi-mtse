@@ -6,16 +6,19 @@ import {
   useDelta, useUpdateEngagement, useCreateManualFinding,
   useDeleteEngagement, useScanStatus, useEngagementReportTemplates,
   useRevealWebhookSecret, useRotateWebhookSecret,
+  useWebhookDeliveries, useTestWebhook,
+  useScheduledScans, useCreateScheduledScan, useUpdateScheduledScan, useDeleteScheduledScan,
+  useEngagementMembers, useAddEngagementMember, useRemoveEngagementMember,
 } from '../lib/hooks';
 import { SevBadge, StatusBadge } from '../components/Badges';
 import { engagements, findings } from '../lib/api';
-import type { FindingOut } from '../lib/api';
+import type { FindingOut, WebhookDeliveryOut } from '../lib/api';
 
 const SEV_COLORS: Record<string, string> = {
   Critical:'#ef4444', High:'#f97316', Medium:'#eab308', Low:'#3b82f6', Info:'#6b7280',
 };
 
-type Tab = 'scans' | 'delta' | 'scope' | 'settings';
+type Tab = 'scans' | 'scheduled' | 'delta' | 'scope' | 'settings';
 
 export default function Engagement() {
   const { id }   = useParams<{ id: string }>();
@@ -86,7 +89,7 @@ export default function Engagement() {
 
       {/* Tabs */}
       <div style={{ display:'flex', gap:2, marginBottom:16, borderBottom:'1px solid var(--border)' }}>
-        {(['scans','delta','scope','settings'] as Tab[]).map(t => (
+        {(['scans','scheduled','delta','scope','settings'] as Tab[]).map(t => (
           <button key={t} onClick={() => setTab(t)} style={{
             padding:'8px 18px', background:'none', border:'none',
             borderBottom: tab === t ? '2px solid var(--accent)' : '2px solid transparent',
@@ -180,6 +183,9 @@ export default function Engagement() {
         </div>
       )}
 
+      {/* Scheduled scans tab */}
+      {tab === 'scheduled' && <ScheduledScansPanel engId={engId} />}
+
       {/* Delta tab */}
       {tab === 'delta' && <DeltaPanel engId={engId} scans={scans ?? []} />}
 
@@ -192,6 +198,9 @@ export default function Engagement() {
       {/* Settings tab */}
       {tab === 'settings' && (
         <div style={{ display:'flex', flexDirection:'column', gap:16 }}>
+          <MembersPanel engId={engId} isOwnerOrAdmin={
+            user?.role === 'Admin' || eng.created_by === user?.id
+          } />
           <WebhookPanel engId={engId} webhookUrl={eng.webhook_url}
                         editing={editWebhook} setEditing={setEditWebhook} />
           <ReportTemplatePanel engId={engId}
@@ -432,6 +441,86 @@ function ScopePanel({ engId, scope, editing, setEditing }: {
   );
 }
 
+/* ── Members (engagement sharing) ─────────────────────────────────────────── */
+function MembersPanel({ engId, isOwnerOrAdmin }: { engId: number; isOwnerOrAdmin: boolean }) {
+  const { data: members = [], isLoading } = useEngagementMembers(engId);
+  const add    = useAddEngagementMember(engId);
+  const remove = useRemoveEngagementMember(engId);
+  const [username, setUsername] = useState('');
+  const [error, setError] = useState('');
+
+  async function handleAdd() {
+    setError('');
+    if (!username.trim()) { setError('Username is required'); return; }
+    try {
+      await add.mutateAsync(username.trim());
+      setUsername('');
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to add member');
+    }
+  }
+
+  async function handleRemove(userId: number, uname: string) {
+    if (!confirm(`Remove ${uname} from this engagement?`)) return;
+    try {
+      await remove.mutateAsync(userId);
+    } catch (e: unknown) {
+      alert(e instanceof Error ? e.message : 'Failed to remove member');
+    }
+  }
+
+  return (
+    <div className="card" style={{ padding:24 }}>
+      <h2 style={{ fontSize:14, fontWeight:600, marginBottom:4 }}>Members</h2>
+      <div style={{ fontSize:12, color:'var(--muted)', marginBottom:16 }}>
+        People with access to this engagement beyond its creator. A member gets
+        the same read/write access as the owner, bounded by their own account role
+        — a Viewer added here still can't edit, only view.
+      </div>
+
+      {error && <div style={{ fontSize:12, color:'#ef4444', marginBottom:10 }}>{error}</div>}
+
+      {isLoading ? (
+        <div style={{ fontSize:13, color:'var(--muted)' }}>Loading…</div>
+      ) : members.length === 0 ? (
+        <div style={{ fontSize:13, color:'var(--muted)', marginBottom:16 }}>
+          No additional members — only the owner (and Admins) can access this engagement.
+        </div>
+      ) : (
+        <div style={{ display:'flex', flexDirection:'column', gap:6, marginBottom:16 }}>
+          {members.map(m => (
+            <div key={m.id} style={{
+              display:'flex', alignItems:'center', gap:10, fontSize:13,
+              background:'var(--surface2)', borderRadius:6, padding:'8px 12px',
+            }}>
+              <span style={{ fontWeight:500 }}>{m.username}</span>
+              <span style={{ fontSize:11, color:'var(--muted)' }}>{m.role}</span>
+              <span style={{ flex:1 }} />
+              {isOwnerOrAdmin && (
+                <button className="btn btn-ghost btn-sm" style={{ color:'#ef4444' }}
+                        onClick={() => handleRemove(m.user_id, m.username)}>
+                  Remove
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {isOwnerOrAdmin && (
+        <div style={{ display:'flex', gap:8 }}>
+          <input value={username} onChange={e => setUsername(e.target.value)}
+                 placeholder="Username to add" style={{ flex:1 }}
+                 onKeyDown={e => { if (e.key === 'Enter') handleAdd(); }} />
+          <button className="btn btn-primary btn-sm" onClick={handleAdd} disabled={add.isPending}>
+            {add.isPending ? 'Adding…' : 'Add Member'}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ── Webhook settings ─────────────────────────────────────────────────────── */
 function WebhookPanel({ engId, webhookUrl, editing, setEditing }: {
   engId: number; webhookUrl: string | null;
@@ -514,6 +603,99 @@ function WebhookPanel({ engId, webhookUrl, editing, setEditing }: {
       )}
 
       {webhookUrl && !editing && <WebhookSecretSection engId={engId} />}
+      {webhookUrl && !editing && <WebhookDeliverySection engId={engId} />}
+    </div>
+  );
+}
+
+/* ── Webhook delivery history + test ping ────────────────────────────────── */
+function WebhookDeliverySection({ engId }: { engId: number }) {
+  const [expanded, setExpanded] = useState(false);
+  const { data: deliveries = [], isLoading } = useWebhookDeliveries(engId, expanded);
+  const test = useTestWebhook(engId);
+  const [testResult, setTestResult] = useState<WebhookDeliveryOut | null>(null);
+
+  async function sendTest() {
+    setTestResult(null);
+    try {
+      const result = await test.mutateAsync();
+      setTestResult(result);
+      setExpanded(true);
+    } catch {
+      // test.error renders below
+    }
+  }
+
+  return (
+    <div style={{ marginTop:16, paddingTop:16, borderTop:'1px solid var(--border)' }}>
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center',
+                    marginBottom:8 }}>
+        <button className="btn btn-ghost btn-sm" onClick={() => setExpanded(v => !v)}>
+          {expanded ? '▾' : '▸'} Delivery History
+        </button>
+        <button className="btn btn-ghost btn-sm" onClick={sendTest} disabled={test.isPending}>
+          {test.isPending ? 'Sending…' : 'Send Test Ping'}
+        </button>
+      </div>
+
+      {test.error && (
+        <div style={{ fontSize:12, color:'#ef4444', marginBottom:8 }}>
+          {test.error instanceof Error ? test.error.message : 'Test ping failed'}
+        </div>
+      )}
+
+      {testResult && (
+        <div style={{
+          fontSize:12, marginBottom:8, padding:'8px 12px', borderRadius:6,
+          background: testResult.success
+            ? 'color-mix(in srgb, #4ade80 15%, transparent)'
+            : 'color-mix(in srgb, #ef4444 15%, transparent)',
+          color: testResult.success ? '#4ade80' : '#ef4444',
+        }}>
+          {testResult.success
+            ? `✓ Test ping delivered (HTTP ${testResult.status_code}, ${testResult.duration_ms}ms)`
+            : `✗ Test ping failed${testResult.status_code ? ` (HTTP ${testResult.status_code})` : ''}${testResult.error ? ` — ${testResult.error}` : ''}`}
+        </div>
+      )}
+
+      {expanded && (
+        isLoading ? (
+          <div style={{ fontSize:12, color:'var(--muted)' }}>Loading…</div>
+        ) : deliveries.length === 0 ? (
+          <div style={{ fontSize:12, color:'var(--muted)' }}>
+            No deliveries yet — they'll show up here once a scan completes or
+            you send a test ping.
+          </div>
+        ) : (
+          <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
+            {deliveries.map(d => (
+              <div key={d.id} style={{
+                display:'flex', alignItems:'center', gap:10, fontSize:12,
+                background:'var(--surface2)', borderRadius:6, padding:'8px 12px',
+              }}>
+                <span style={{ color: d.success ? '#4ade80' : '#ef4444', fontWeight:600 }}>
+                  {d.success ? '✓' : '✗'}
+                </span>
+                <span style={{
+                  fontSize:11, textTransform:'uppercase', color:'var(--muted)',
+                  minWidth:90,
+                }}>
+                  {d.event === 'webhook.test' ? 'Test Ping' : 'Scan Complete'}
+                </span>
+                <span style={{ color:'var(--muted)', minWidth:60 }}>
+                  {d.status_code ?? '—'}
+                </span>
+                <span style={{ color:'var(--muted)', flex:1 }}>
+                  {d.error ?? (d.duration_ms !== null ? `${d.duration_ms}ms` : '')}
+                </span>
+                <span style={{ color:'var(--muted)', fontSize:11 }}>
+                  {d.created_at ? new Date(d.created_at).toLocaleString() : ''}
+                </span>
+              </div>
+            ))}
+          </div>
+        )
+      )}
     </div>
   );
 }
@@ -811,6 +993,261 @@ function DeltaBucket({ title, color, findings }: {
 }
 
 /* ── New Scan Modal ─────────────────────────────────────────────────────────── */
+/* ── Scheduled scans ──────────────────────────────────────────────────────── */
+function ScheduledScansPanel({ engId }: { engId: number }) {
+  const { data: schedules = [], isLoading } = useScheduledScans(engId);
+  const update = useUpdateScheduledScan(engId);
+  const del    = useDeleteScheduledScan(engId);
+  const [showNew, setShowNew] = useState(false);
+
+  async function toggleEnabled(schedId: number, enabled: boolean) {
+    try {
+      await update.mutateAsync({ schedId, body: { enabled } });
+    } catch (e: unknown) {
+      alert(e instanceof Error ? e.message : 'Update failed');
+    }
+  }
+
+  async function handleDelete(schedId: number, target: string) {
+    if (!confirm(`Delete the recurring scan for "${target}"? This cannot be undone.`)) return;
+    try {
+      await del.mutateAsync(schedId);
+    } catch (e: unknown) {
+      alert(e instanceof Error ? e.message : 'Delete failed');
+    }
+  }
+
+  return (
+    <div className="card">
+      <div className="card-head" style={{ display:'flex', justifyContent:'space-between',
+                                           alignItems:'center' }}>
+        <div>
+          <h2 style={{ fontSize:14, fontWeight:600 }}>Scheduled Scans</h2>
+          <div style={{ fontSize:12, color:'var(--muted)', marginTop:2 }}>
+            Recurring scans dispatched automatically on an interval.
+          </div>
+        </div>
+        <button className="btn btn-primary btn-sm" onClick={() => setShowNew(true)}>
+          + New Schedule
+        </button>
+      </div>
+
+      {isLoading ? (
+        <div className="empty">Loading…</div>
+      ) : schedules.length === 0 ? (
+        <div className="empty" style={{ padding:'32px 20px' }}>
+          No recurring scans configured for this engagement.
+        </div>
+      ) : (
+        <table>
+          <thead>
+            <tr>
+              <th>Type</th><th>Target</th><th>Interval</th>
+              <th>Next Run</th><th>Last Run</th><th>Status</th><th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {schedules.map(s => (
+              <tr key={s.id}>
+                <td style={{ textTransform:'uppercase', fontSize:11 }}>{s.scan_type}</td>
+                <td style={{ maxWidth:220, overflow:'hidden', textOverflow:'ellipsis' }}>
+                  {s.target}
+                </td>
+                <td>{formatInterval(s.interval_hours)}</td>
+                <td style={{ fontSize:12, color:'var(--muted)' }}>
+                  {s.enabled && s.next_run_at ? new Date(s.next_run_at).toLocaleString() : '—'}
+                </td>
+                <td style={{ fontSize:12, color:'var(--muted)' }}>
+                  {s.last_run_at ? new Date(s.last_run_at).toLocaleString() : 'Never'}
+                </td>
+                <td>
+                  <label style={{ display:'flex', alignItems:'center', gap:6, cursor:'pointer' }}>
+                    <input type="checkbox" checked={s.enabled}
+                          onChange={e => toggleEnabled(s.id, e.target.checked)}
+                          style={{ width:14, height:14, accentColor:'var(--accent)' }} />
+                    <span style={{ fontSize:12, color: s.enabled ? '#4ade80' : 'var(--muted)' }}>
+                      {s.enabled ? 'Active' : 'Paused'}
+                    </span>
+                  </label>
+                </td>
+                <td>
+                  <button className="btn btn-ghost btn-sm" style={{ color:'#ef4444' }}
+                          onClick={() => handleDelete(s.id, s.target)}>
+                    Delete
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+
+      {showNew && <ScheduleModal engId={engId} onClose={() => setShowNew(false)} />}
+    </div>
+  );
+}
+
+function formatInterval(hours: number): string {
+  if (hours === 1)   return 'Hourly';
+  if (hours === 24)  return 'Daily';
+  if (hours === 168) return 'Weekly';
+  if (hours === 720) return 'Monthly';
+  return hours < 24 ? `Every ${hours}h` : `Every ${Math.round(hours / 24)}d`;
+}
+
+function ScheduleModal({ engId, onClose }: { engId: number; onClose: () => void }) {
+  const create = useCreateScheduledScan(engId);
+  const [scanType, setScanType] = useState('web');
+  const [target,   setTarget  ] = useState('');
+  const [interval, setInterval_] = useState(24);
+  const [customHours, setCustomHours] = useState('');
+  const [runNow,   setRunNow  ] = useState(false);
+  const [auth,     setAuth    ] = useState('');
+  const [proxy,    setProxy   ] = useState('');
+  const [katana,   setKatana  ] = useState(false);
+  const [sqlmap,   setSqlmap  ] = useState(false);
+  const [stealth,  setStealth ] = useState(false);
+  const [gitToken, setGitToken] = useState('');
+  const [error,    setError   ] = useState('');
+  const [warning,  setWarning ] = useState('');
+
+  const isCustom = interval === -1;
+  const effectiveHours = isCustom ? parseInt(customHours, 10) : interval;
+
+  async function submit() {
+    setError(''); setWarning('');
+    if (!target.trim()) { setError('Target is required'); return; }
+    if (!effectiveHours || effectiveHours < 1 || effectiveHours > 8760) {
+      setError('Interval must be between 1 and 8760 hours'); return;
+    }
+    try {
+      const body: Parameters<typeof create.mutateAsync>[0] = {
+        scan_type: scanType, target, interval_hours: effectiveHours,
+        run_immediately: runNow,
+      };
+      if (auth)     body.auth_header = auth;
+      if (proxy)    body.proxy       = proxy;
+      if (gitToken) body.git_token   = gitToken;
+      body.enable_katana  = katana;
+      body.enable_sqlmap  = sqlmap;
+      body.enable_stealth = stealth;
+      const result = await create.mutateAsync(body);
+      if (result.scope_warning) {
+        setWarning(result.scope_warning);
+      }
+      onClose();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to create schedule');
+    }
+  }
+
+  const cloudHint: Record<string, string> = {
+    cloud:  'Format: provider:resource — e.g. aws:default, gcp:my-project, azure:my-tenant',
+    mobile: 'URL to APK/IPA file — e.g. https://builds.example.com/app.apk',
+    sast:   'Git repository URL — e.g. https://github.com/org/repo',
+    infra:  'IP address or CIDR range — e.g. 192.168.1.0/24',
+    web:    'Full URL including scheme — e.g. https://app.example.com',
+  };
+
+  return (
+    <Overlay onClose={onClose}>
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:20 }}>
+        <h2 style={{ fontSize:16 }}>New Scheduled Scan</h2>
+        <button onClick={onClose} style={closeBtn}>×</button>
+      </div>
+
+      {error   && <div style={errorBox}>{error}</div>}
+      {warning && <div style={{ ...errorBox, background:'#1a1400', color:'#eab308',
+                                border:'1px solid #5a4a00' }}>{warning}</div>}
+
+      <Field label="Scan Type">
+        <select value={scanType} onChange={e => { setScanType(e.target.value); setTarget(''); }}>
+          <option value="web">Web / API</option>
+          <option value="sast">SAST / SCA (Git repo)</option>
+          <option value="infra">Infrastructure (IP / CIDR)</option>
+          <option value="cloud">Cloud (AWS / GCP / Azure)</option>
+          <option value="mobile">Mobile (APK / IPA)</option>
+        </select>
+      </Field>
+
+      <Field label="Target" hint={cloudHint[scanType]}>
+        <input value={target} onChange={e => setTarget(e.target.value)}
+               placeholder={
+                 scanType === 'cloud'  ? 'aws:default' :
+                 scanType === 'mobile' ? 'https://cdn.example.com/app.apk' :
+                 scanType === 'sast'   ? 'https://github.com/org/repo' :
+                 scanType === 'infra'  ? '192.168.1.0/24' :
+                                         'https://app.example.com'
+               } />
+      </Field>
+
+      <Field label="Repeat">
+        <select value={interval} onChange={e => setInterval_(Number(e.target.value))}>
+          <option value={1}>Hourly</option>
+          <option value={24}>Daily</option>
+          <option value={168}>Weekly</option>
+          <option value={720}>Monthly (30 days)</option>
+          <option value={-1}>Custom…</option>
+        </select>
+      </Field>
+
+      {isCustom && (
+        <Field label="Custom interval (hours)">
+          <input type="number" min={1} max={8760} value={customHours}
+                 onChange={e => setCustomHours(e.target.value)} placeholder="e.g. 12" />
+        </Field>
+      )}
+
+      <label style={{ display:'flex', alignItems:'center', gap:8, fontSize:13,
+                      cursor:'pointer', marginBottom:18 }}>
+        <input type="checkbox" checked={runNow} onChange={e => setRunNow(e.target.checked)}
+               style={{ width:15, height:15, accentColor:'var(--accent)' }} />
+        Run the first scan immediately (otherwise, first run is one interval from now)
+      </label>
+
+      {scanType === 'web' && <>
+        <Field label="Auth Header (optional)">
+          <input value={auth} onChange={e => setAuth(e.target.value)}
+                 placeholder="Cookie: PHPSESSID=abc  or  Bearer eyJ…" />
+        </Field>
+        <Field label="Proxy URL (optional)">
+          <input value={proxy} onChange={e => setProxy(e.target.value)}
+                 placeholder="http://host.docker.internal:8081" />
+        </Field>
+        <div style={{ display:'flex', flexDirection:'column', gap:10, marginBottom:18 }}>
+          {([
+            ['Katana SPA crawler',          katana,  setKatana ] as const,
+            ['SQLmap database probe',       sqlmap,  setSqlmap ] as const,
+            ['Stealth mode (rate limiting)', stealth, setStealth] as const,
+          ]).map(([label, val, set]) => (
+            <label key={label} style={{ display:'flex', alignItems:'center', gap:8, fontSize:13, cursor:'pointer' }}>
+              <input type="checkbox" checked={val} onChange={e => set(e.target.checked)}
+                     style={{ width:15, height:15, accentColor:'var(--accent)' }} />
+              {label}
+            </label>
+          ))}
+        </div>
+      </>}
+
+      {scanType === 'sast' && (
+        <Field label="Git Token (optional — private repos)"
+               hint="Stored encrypted at rest — needed on every recurring run, unlike a one-off scan.">
+          <input type="password" value={gitToken} onChange={e => setGitToken(e.target.value)}
+                 placeholder="ghp_…" />
+        </Field>
+      )}
+
+      <div style={{ display:'flex', gap:10, justifyContent:'flex-end', marginTop:8 }}>
+        <button onClick={onClose} className="btn btn-ghost">Cancel</button>
+        <button onClick={submit} disabled={create.isPending} className="btn btn-primary">
+          {create.isPending ? 'Creating…' : 'Create Schedule'}
+        </button>
+      </div>
+    </Overlay>
+  );
+}
+
+/* ── Scan Modal ──────────────────────────────────────────────────────────────── */
 function ScanModal({ engId, onClose, onStarted }: {
   engId: number; onClose: () => void; onStarted: (scanId: string) => void;
 }) {

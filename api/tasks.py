@@ -18,17 +18,15 @@ subscribers.
 """
 
 import hashlib
-import hmac
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
-import tempfile
-import threading
 import urllib.parse
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Generator
 
 import redis as redis_lib
@@ -63,16 +61,29 @@ _celery_config: dict = dict(
     worker_prefetch_multiplier=1,
     result_expires=86400,
     task_routes={
-        'tasks.run_web_scan':    {'queue': 'web'},
-        'tasks.run_sast_scan':   {'queue': 'sast'},
-        'tasks.run_infra_scan':  {'queue': 'infra'},
-        'tasks.run_cloud_scan':  {'queue': 'infra'},
-        'tasks.run_mobile_scan': {'queue': 'infra'},
+        'tasks.run_web_scan':        {'queue': 'web'},
+        'tasks.run_sast_scan':       {'queue': 'sast'},
+        'tasks.run_infra_scan':      {'queue': 'infra'},
+        'tasks.run_cloud_scan':      {'queue': 'infra'},
+        'tasks.run_mobile_scan':     {'queue': 'infra'},
+        # Lightweight (a DB query + a handful of .delay() calls, no scan
+        # work itself) — routed to the infra queue since infra/cloud/mobile
+        # are already low-volume there; no worker listens on the default
+        # "celery" queue in this deployment (see docker-compose.yml's
+        # worker-web/sast/infra, each pinned to -Q <name>), so this MUST be
+        # routed to a queue something actually consumes.
+        'tasks.run_scheduled_scans': {'queue': 'infra'},
+    },
+    beat_schedule={
+        'dispatch-scheduled-scans': {
+            'task':     'tasks.run_scheduled_scans',
+            'schedule': 300.0,  # every 5 minutes
+        },
     },
 )
 
-
-if os.getenv('TESTING') == '1':
+import os as _os
+if _os.getenv('TESTING') == '1':
     # In test mode: use in-memory backend so Celery never tries to connect
     # to Redis for result storage.  Tasks are still mocked via conftest.py
     # so they never actually execute; this config only prevents the result
@@ -155,10 +166,13 @@ def _dispatch_webhook(scan, webhook_url: str, webhook_secret: str | None,
     POST a JSON payload to an engagement's configured webhook_url after a
     scan reaches a terminal status.
 
-    Fire-and-forget: failures are logged, never raised. A worker blocking a
-    scan pipeline on a flaky third-party endpoint would be worse than a
-    missed notification. Uses `requests` (already a dependency for the
-    MobSF REST client) rather than `httpx`, since Celery workers are sync.
+    Fire-and-forget as far as the scan pipeline is concerned — failures
+    never raise here — but every attempt (success or failure) is recorded
+    to webhook_deliveries so it's visible in the Settings tab rather than
+    only in worker logs. A worker blocking a scan pipeline on a flaky
+    third-party endpoint would still be worse than a missed notification,
+    so the HTTP call itself keeps its short timeout and no-raise behavior;
+    only the bookkeeping around it changed.
 
     webhook_url is validated at write time (schemas.py::_validate_webhook_url
     — http/https scheme + SSRF blocklist), but that only constrains the
@@ -167,25 +181,18 @@ def _dispatch_webhook(scan, webhook_url: str, webhook_secret: str | None,
     radius rather than trying to re-validate on every dispatch.
 
     Signing: if webhook_secret is set (it's auto-generated the first time a
-    webhook_url is configured — see routers/engagements.py), the request
-    carries X-MSTE-Signature and X-MSTE-Timestamp headers so the receiver
-    can verify the delivery actually came from this instance and wasn't
-    forged by anyone who guessed/scraped the URL. Follows the
-    Stripe/GitHub convention of signing "{timestamp}.{body}" rather than
-    just the body, so a captured request can't be replayed indefinitely —
-    receivers are expected to reject deliveries with a stale timestamp
-    (a 5-minute window is a reasonable default).
-
-        signed_content = f'{timestamp}.{raw_body}'
-        signature = hmac.new(secret.encode(), signed_content.encode(),
-                             hashlib.sha256).hexdigest()
-
+    webhook_url is configured — see routers/engagements.py), the request is
+    signed via webhooks.sign_payload — see that module for why signing logic
+    lives in one place shared with the on-demand test-ping endpoint.
     Signing is best-effort: an engagement created before this feature (or
     whose secret generation somehow failed) has webhook_secret=None, and
-    still gets deliveries — just unsigned ones. Emits a one-time warning per
-    call so this is visible in worker logs rather than silently degrading.
+    still gets deliveries — just unsigned ones.
     """
+    import time
     import requests
+    from models import Engagement, MAX_DELIVERIES_PER_ENGAGEMENT, WebhookDelivery
+    from webhooks import serialize_payload, sign_payload
+
     payload = {
         'event':          'scan.completed',
         'scan_id':        scan.scan_id,
@@ -196,32 +203,54 @@ def _dispatch_webhook(scan, webhook_url: str, webhook_secret: str | None,
         'finding_count':  finding_count,
         'completed_at':   scan.completed_at.isoformat() if scan.completed_at else None,
     }
-    # Signed over the exact bytes sent — json.dumps here (not requests'
-    # internal serialisation) so the signature matches what the receiver
-    # actually reads off the wire, with a stable key order for
-    # reproducibility.
-    raw_body = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+    raw_body = serialize_payload(payload)
 
     headers = {'Content-Type': 'application/json'}
     if webhook_secret:
-        timestamp = str(int(datetime.now(timezone.utc).timestamp()))
-        signed_content = f'{timestamp}.{raw_body}'
-        signature = hmac.new(webhook_secret.encode(), signed_content.encode(),
-                             hashlib.sha256).hexdigest()
-        headers['X-MSTE-Signature'] = f'sha256={signature}'
-        headers['X-MSTE-Timestamp'] = timestamp
+        headers.update(sign_payload(webhook_secret, raw_body))
     else:
         logger.warning('scan %s: dispatching unsigned webhook (no secret on engagement %s)',
                        scan.scan_id, scan.engagement_id)
 
+    success          = False
+    status_code      = None
+    error            = None
+    response_snippet = None
+
+    start = time.monotonic()
     try:
-        requests.post(
+        resp = requests.post(
             webhook_url, data=raw_body, headers=headers,
             timeout=5, allow_redirects=False,
         )
+        status_code      = resp.status_code
+        success          = 200 <= resp.status_code < 300
+        response_snippet = resp.text[:500] if resp.text else None
     except Exception as exc:
+        error = str(exc)[:2000]
         logger.warning('webhook dispatch failed for scan %s -> %s: %s',
                        scan.scan_id, webhook_url, exc)
+    duration_ms = int((time.monotonic() - start) * 1000)
+
+    with _db_session() as db:
+        db.add(WebhookDelivery(
+            engagement_id=scan.engagement_id, scan_id=scan.scan_id,
+            event='scan.completed', url=webhook_url, success=success,
+            status_code=status_code, error=error,
+            response_snippet=response_snippet, duration_ms=duration_ms,
+        ))
+        # Prune to the most recent N — diagnostic history, not an audit
+        # trail, so unbounded retention isn't the goal.
+        old_ids = db.execute(
+            select(WebhookDelivery.id)
+            .where(WebhookDelivery.engagement_id == scan.engagement_id)
+            .order_by(WebhookDelivery.created_at.desc())
+            .offset(MAX_DELIVERIES_PER_ENGAGEMENT)
+        ).scalars().all()
+        if old_ids:
+            db.execute(
+                WebhookDelivery.__table__.delete().where(WebhookDelivery.id.in_(old_ids))
+            )
 
 
 def _update_scan_status(scan_id: str, status: str,
@@ -318,7 +347,6 @@ def _upsert_finding(db: Session, scan_db_id: int, scan_id_str: str,
 
     if existing:
         existing.last_seen = datetime.now(timezone.utc)
-        existing.tool_count += 1
         if existing.status == 'Fixed':
             existing.status = 'Open'
         return existing
@@ -367,16 +395,11 @@ def _docker_run(scan_id: str, name: str, args: list[str],
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
         )
-        _timer = threading.Timer(14400, proc.kill)  # 4 hours
-        _timer.start()
-        try:
-            for line in iter(proc.stdout.readline, ''):
-                lines.append(line.rstrip())
-                publish_progress(scan_id, line.rstrip())
-            proc.stdout.close()
-            proc.wait()
-        finally:
-            _timer.cancel()
+        for line in iter(proc.stdout.readline, ''):
+            lines.append(line.rstrip())
+            publish_progress(scan_id, line.rstrip())
+        proc.stdout.close()
+        proc.wait()
         return proc.returncode, '\n'.join(lines)
     except Exception as e:
         publish_progress(scan_id, f'Container error: {e}', level='error')
@@ -384,13 +407,126 @@ def _docker_run(scan_id: str, name: str, args: list[str],
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# WEB SCAN
+# SCHEDULED SCAN DISPATCH (Celery Beat, every 5 min — see beat_schedule above)
 # ─────────────────────────────────────────────────────────────────────────────
 
-@celery.task(bind=True, name='tasks.run_web_scan', max_retries=1,
-             # Scan options may contain sensitive auth headers; limit result
-             # backend exposure to 5 minutes (same as SAST/cloud/mobile).
-             result_expires=300)
+# scan_type -> task function. Deliberately separate from
+# routers/engagements.py's TASK_MAP (same mapping, different module) rather
+# than importing it here — that module imports several of *this* module's
+# task functions already (`from tasks import run_web_scan, ...`), so
+# importing engagements.py back from tasks.py would be circular.
+_SCHEDULED_TASK_MAP: dict = {}
+
+
+def _get_scheduled_task_map() -> dict:
+    """Lazy — built on first use so this module's own task functions
+    (defined further down in this file) exist by the time it's called."""
+    global _SCHEDULED_TASK_MAP
+    if not _SCHEDULED_TASK_MAP:
+        _SCHEDULED_TASK_MAP = {
+            'web':    run_web_scan,
+            'sast':   run_sast_scan,
+            'infra':  run_infra_scan,
+            'cloud':  run_cloud_scan,
+            'mobile': run_mobile_scan,
+        }
+    return _SCHEDULED_TASK_MAP
+
+
+@celery.task(name='tasks.run_scheduled_scans')
+def run_scheduled_scans():
+    """
+    Periodic dispatcher: find every enabled ScheduledScan whose next_run_at
+    has passed, launch a real Scan for each, and re-anchor next_run_at.
+
+    Each row is processed independently with its own try/except — one
+    schedule failing to dispatch (e.g. a decrypt failure on a rotated
+    JWT_SECRET) must not block every other engagement's scheduled scans
+    from firing. Errors are logged and the row's next_run_at is still
+    advanced, so a persistently-broken schedule fails loudly on a normal
+    cadence rather than either silently never running again or hammering
+    retries every 5 minutes.
+    """
+    from crypto_utils import decrypt_secret
+    from models import Engagement, Scan, ScheduledScan
+
+    now = datetime.now(timezone.utc)
+    task_map = _get_scheduled_task_map()
+
+    with _db_session() as db:
+        due = db.execute(
+            select(ScheduledScan).where(
+                ScheduledScan.enabled == True,           # noqa: E712 (SQLAlchemy needs ==, not is)
+                ScheduledScan.next_run_at <= now,
+            )
+        ).scalars().all()
+
+        for sched in due:
+            try:
+                task_fn = task_map.get(sched.scan_type)
+                if not task_fn:
+                    logger.warning('scheduled scan %s: unknown scan_type %r',
+                                   sched.id, sched.scan_type)
+                    continue
+
+                engagement = db.execute(
+                    select(Engagement).where(Engagement.id == sched.engagement_id)
+                ).scalar_one_or_none()
+                if not engagement:
+                    logger.warning('scheduled scan %s: engagement %s no longer exists',
+                                   sched.id, sched.engagement_id)
+                    continue
+
+                # Mirrors routers/engagements.py::start_scan's naming scheme —
+                # keep these in sync if that scheme ever changes.
+                clean   = re.sub(r'[^\w.-]', '_', sched.target)[:60]
+                ts      = datetime.now().strftime('%Y%m%d_%H%M%S')
+                folder  = f'{sched.scan_type}_{clean}_{ts}'
+                scan_id = os.urandom(8).hex()
+
+                git_token = ''
+                if sched.git_token_encrypted:
+                    decrypted = decrypt_secret(sched.git_token_encrypted)
+                    if decrypted is None:
+                        logger.warning(
+                            'scheduled scan %s: could not decrypt stored git_token '
+                            '(key rotated since it was saved?) — running without it',
+                            sched.id,
+                        )
+                    else:
+                        git_token = decrypted
+
+                options = dict(sched.options or {})
+                task_options = {**options, 'git_token': git_token}
+
+                new_scan = Scan(
+                    scan_id=scan_id, engagement_id=sched.engagement_id,
+                    scan_type=sched.scan_type, target=sched.target,
+                    folder_name=folder, status='Queued', options=options,
+                    created_by=sched.created_by,
+                )
+                db.add(new_scan)
+                db.flush()
+
+                task = task_fn.delay(scan_id, sched.target, folder, task_options)
+                new_scan.celery_task_id = task.id
+
+                sched.last_run_at  = now
+                sched.last_scan_id = scan_id
+                sched.next_run_at  = now + timedelta(hours=sched.interval_hours)
+
+                logger.info('scheduled scan %s dispatched -> scan_id=%s', sched.id, scan_id)
+
+            except Exception as exc:
+                logger.error('scheduled scan %s failed to dispatch: %s', sched.id, exc)
+                # Still advance next_run_at — a schedule that errors every
+                # tick would otherwise fire continuously rather than on its
+                # configured cadence.
+                sched.next_run_at = now + timedelta(hours=sched.interval_hours)
+        # commit happens when the _db_session() context manager exits
+
+
+@celery.task(bind=True, name='tasks.run_web_scan', max_retries=1)
 def run_web_scan(self, scan_id: str, target: str, folder: str,
                  options: dict[str, Any]):
     _update_scan_status(scan_id, 'Running', started=True)
@@ -422,15 +558,10 @@ def run_web_scan(self, scan_id: str, target: str, folder: str,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1,
         )
-        _timer = threading.Timer(14400, proc.kill)  # 4 hours
-        _timer.start()
-        try:
-            for line in iter(proc.stdout.readline, ''):
-                publish_progress(scan_id, line.rstrip())
-            proc.stdout.close()
-            proc.wait()
-        finally:
-            _timer.cancel()
+        for line in iter(proc.stdout.readline, ''):
+            publish_progress(scan_id, line.rstrip())
+        proc.stdout.close()
+        proc.wait()
 
         if proc.returncode != 0:
             raise RuntimeError(f'scan.sh exited with code {proc.returncode}')
@@ -614,8 +745,7 @@ def _parse_sast_findings(db: Session, scan_rec, output_dir: str, scan_id: str):
 # INFRA SCAN
 # ─────────────────────────────────────────────────────────────────────────────
 
-@celery.task(bind=True, name='tasks.run_infra_scan', max_retries=1,
-             result_expires=300)
+@celery.task(bind=True, name='tasks.run_infra_scan', max_retries=1)
 def run_infra_scan(self, scan_id: str, target: str, folder: str,
                    options: dict[str, Any]):
     _update_scan_status(scan_id, 'Running', started=True)
@@ -734,7 +864,6 @@ def run_cloud_scan(self, scan_id: str, target: str, folder: str,
 
     # ── Build credential environment for container runs ────────────────────────
     cred_env: list[str] = []
-    creds_path: str | None = None
 
     if provider == 'aws':
         key_id     = options.get('aws_access_key_id', '')
@@ -765,14 +894,12 @@ def run_cloud_scan(self, scan_id: str, target: str, folder: str,
                              level='error')
             _update_scan_status(scan_id, 'Failed', completed=True)
             return
-        # Write credentials file with restrictive permissions (cleaned up with the scan)
-        fd, creds_path = tempfile.mkstemp(
-            dir=output_dir, prefix='gcp-creds-', suffix='.json')
-        os.chmod(creds_path, 0o600)
-        with os.fdopen(fd, 'w') as f:
+        # Write credentials file into the output dir (cleaned up with the scan)
+        creds_path = os.path.join(output_dir, 'gcp-credentials.json')
+        with open(creds_path, 'w') as f:
             f.write(gcp_json)
         cred_env = [
-            '-e', f'GOOGLE_APPLICATION_CREDENTIALS=/output/{os.path.basename(creds_path)}',
+            '-e', 'GOOGLE_APPLICATION_CREDENTIALS=/output/gcp-credentials.json',
         ]
 
     elif provider == 'azure':
@@ -847,7 +974,8 @@ def run_cloud_scan(self, scan_id: str, target: str, folder: str,
     publish_progress(scan_id, '[Cloud Scan] Complete.', level='success')
 
     # Scrub GCP credentials file if written
-    if creds_path and os.path.exists(creds_path):
+    creds_path = os.path.join(output_dir, 'gcp-credentials.json')
+    if os.path.exists(creds_path):
         os.remove(creds_path)
 
 

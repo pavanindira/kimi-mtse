@@ -205,12 +205,14 @@ from routers.engagements import router as engagements_router
 from routers.findings    import router as findings_router
 from routers.search      import router as search_router
 from routers.admin       import router as admin_router
+from routers.dashboard   import router as dashboard_router
 
 app.include_router(auth_router)
 app.include_router(engagements_router)
 app.include_router(findings_router)
 app.include_router(search_router)
 app.include_router(admin_router)
+app.include_router(dashboard_router)
 
 
 # ── Health probes (unauthenticated — used by Docker / K8s) ───────────────────

@@ -8,8 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from auth import AdminUser, hash_password, invalidate_user_cache
 from database import get_db
-from models import AuditLog, ReportTemplate, User
-from schemas import (AuditLogOut, PaginatedAuditLog, ReportTemplateOut,
+from models import AuditLog, Engagement, ReportTemplate, User
+from schemas import (AuditLogOut, PaginatedAuditLog, ReportTemplateCreate,
+                     ReportTemplateDetail, ReportTemplateOut, ReportTemplateUpdate,
                      UserCreate, UserOut, UserRoleUpdate)
 from utils import add_audit_log, get_client_ip
 
@@ -163,6 +164,143 @@ async def list_report_templates(
     """List all report templates (id, name, is_default, has_logo)."""
     rows = (await db.execute(select(ReportTemplate))).scalars().all()
     return [ReportTemplateOut.from_orm_obj(r) for r in rows]
+
+
+@router.post('/report-templates', response_model=ReportTemplateDetail,
+            status_code=status.HTTP_201_CREATED)
+async def create_report_template(
+    body:    ReportTemplateCreate,
+    request: Request,
+    admin:   AdminUser,
+    db:      AsyncSession = Depends(get_db),
+):
+    """
+    Create a new report template from raw HTML/Jinja2.
+
+    Never set as default automatically — use the set-default endpoint once
+    it's been reviewed. html_template syntax is validated on the way in
+    (schemas.py::_validate_template_syntax) so a typo surfaces here rather
+    than at PDF-export time for whoever runs the export.
+    """
+    tmpl = ReportTemplate(name=body.name, html_template=body.html_template,
+                          is_default=False)
+    db.add(tmpl)
+    await db.flush()
+
+    add_audit_log(db, action='report_template.created',
+                  user_id=admin.id, username=admin.username,
+                  target_type='report_template', target_id=tmpl.id,
+                  target_name=tmpl.name, ip_address=get_client_ip(request))
+
+    return ReportTemplateDetail.from_orm_obj(tmpl)
+
+
+@router.get('/report-templates/{template_id}', response_model=ReportTemplateDetail)
+async def get_report_template(
+    template_id: int,
+    admin:       AdminUser,
+    db:          AsyncSession = Depends(get_db),
+):
+    """Fetch a single template including its full HTML — used by the edit view."""
+    template = (await db.execute(
+        select(ReportTemplate).where(ReportTemplate.id == template_id)
+    )).scalar_one_or_none()
+    if not template:
+        raise HTTPException(status_code=404, detail='Report template not found')
+    return ReportTemplateDetail.from_orm_obj(template)
+
+
+@router.patch('/report-templates/{template_id}', response_model=ReportTemplateDetail)
+async def update_report_template(
+    template_id: int,
+    body:        ReportTemplateUpdate,
+    request:     Request,
+    admin:       AdminUser,
+    db:          AsyncSession = Depends(get_db),
+):
+    """Partially update a template's name and/or HTML content."""
+    template = (await db.execute(
+        select(ReportTemplate).where(ReportTemplate.id == template_id)
+    )).scalar_one_or_none()
+    if not template:
+        raise HTTPException(status_code=404, detail='Report template not found')
+
+    changed: dict = {}
+    if body.name          is not None: changed['name']          = body.name
+    if body.html_template is not None: changed['html_template'] = body.html_template
+
+    if not changed:
+        return ReportTemplateDetail.from_orm_obj(template)  # no-op
+
+    for field, value in changed.items():
+        setattr(template, field, value)
+
+    # HTML content can be large and isn't useful in an audit trail row —
+    # log that it changed, not the new contents.
+    audit_detail = {**changed}
+    if 'html_template' in audit_detail:
+        audit_detail['html_template'] = f'<{len(changed["html_template"])} chars>'
+
+    add_audit_log(db, action='report_template.updated',
+                  user_id=admin.id, username=admin.username,
+                  target_type='report_template', target_id=template.id,
+                  target_name=template.name, detail=audit_detail,
+                  ip_address=get_client_ip(request))
+
+    await db.flush()
+    return ReportTemplateDetail.from_orm_obj(template)
+
+
+@router.delete('/report-templates/{template_id}', status_code=status.HTTP_204_NO_CONTENT)
+async def delete_report_template(
+    template_id: int,
+    request:     Request,
+    admin:       AdminUser,
+    db:          AsyncSession = Depends(get_db),
+):
+    """
+    Delete a report template.
+
+    Blocks deleting the current default outright — forces an explicit
+    choice of a new default first rather than silently falling back to the
+    hardcoded built-in template (report.py's DEFAULT_TEMPLATE_HTML), which
+    would be a surprising, hard-to-notice change for anyone who assumed
+    "default" meant this specific template.
+
+    Engagements with report_template_id pointing at this row are
+    explicitly reset to NULL (falls back to whatever the default is) before
+    the delete. The FK already carries ondelete='SET NULL' at the DB level,
+    but SQLite — used by the test suite — doesn't enforce FK actions
+    without an explicit PRAGMA, so this is done at the application layer to
+    behave identically in tests and in production Postgres.
+    """
+    template = (await db.execute(
+        select(ReportTemplate).where(ReportTemplate.id == template_id)
+    )).scalar_one_or_none()
+    if not template:
+        raise HTTPException(status_code=404, detail='Report template not found')
+
+    if template.is_default:
+        raise HTTPException(
+            status_code=400,
+            detail='Cannot delete the default template — set a different '
+                   'template as default first.',
+        )
+
+    affected = (await db.execute(
+        select(Engagement).where(Engagement.report_template_id == template_id)
+    )).scalars().all()
+    for eng in affected:
+        eng.report_template_id = None
+
+    add_audit_log(db, action='report_template.deleted',
+                  user_id=admin.id, username=admin.username,
+                  target_type='report_template', target_id=template.id,
+                  target_name=template.name,
+                  detail={'engagements_reset': len(affected)},
+                  ip_address=get_client_ip(request))
+
+    await db.delete(template)
 
 
 @router.post('/report-templates/{template_id}/logo',
